@@ -168,8 +168,10 @@ class AxialAttention(nn.Module):
 
 class BlockAxial(AxialAttention):
     def __init__(self, config):
+        # Axial self-attention只负责当前帧结构建模；
+        # 参考帧信息由TSR_model_RefKV中的GlobalCrossAttention统一处理。
         super().__init__(config.n_embd, config.n_head, config.attn_pdrop, config.resid_pdrop, 32, 32,
-                         use_ref_kv=getattr(config, 'use_ref_kv', False))
+                         use_ref_kv=False)
 
 # --- 3. 因果自注意力 (用于 Sequence Block) ---
 # 【修复】：之前漏掉了这个类，现在补上
