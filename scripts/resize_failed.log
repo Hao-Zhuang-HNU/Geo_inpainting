@@ -1,0 +1,1 @@
+/root/autodl-tmp/Inpainting/dataset/scannet_pp_more_seq/193672f661_part1/dslr/resized_undistorted_images/DSC07866.JPG : module 'PIL._webp' has no attribute 'HAVE_WEBPANIM'

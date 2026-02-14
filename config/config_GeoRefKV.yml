@@ -1,0 +1,63 @@
+# ===============================================================
+# 全局训练配置 (Global Training Settings)
+# ===============================================================
+model_settings:
+  name: "Geo_0126"
+  pretrain_ckpt: "ckpt/best_transformer_places2.pth"
+  tb_images: True
+  tb_max_images: 5
+  tb_logdir: "/root/tf-logs/"
+
+training_params:
+  lr: 1e-4
+  train_epoch: 50
+  batch_size: 120
+  num_workers: 6
+  prefetch_factor: 2
+  AMP: True
+  MaP: True
+  focal_weight: 1.0
+  tversky_weight: 1.0
+  line_tv_alpha: 0.4
+  line_tv_beta: 0.6
+  dilate1_ep: 31
+  disable_edge: True
+ablation_params:
+
+# ===============================================================
+# 数据集 1: DL3DV
+# ===============================================================
+dataset1:
+  enable: True
+  name: "DL3DV"
+  ratio: 1
+  train_imgs_list: "scripts/filter_DL3DV_40/train_imgs_clean.txt"
+  train_pkls_list: "scripts/filter_DL3DV_40/train_pkls_clean.txt"
+  train_npzs_list: "scripts/filter_DL3DV_40/train_npzs_clean.txt"
+
+  val_imgs_list: "scripts/filter_DL3DV_val/train_imgs_clean.txt"
+  val_pkls_list: "scripts/filter_DL3DV_val/train_pkls_clean.txt"
+  val_npzs_list: "scripts/filter_DL3DV_val/train_npzs_clean.txt"
+
+# ===============================================================
+# 数据集 2: ScannetPP
+# ===============================================================
+dataset2:
+  enable: True
+  name: "ScannetPP"
+  ratio: 1
+  train_imgs_list: "scripts/filter_ScannetPP_40/train_imgs_clean.txt"
+  train_pkls_list: "scripts/filter_ScannetPP_40/train_pkls_clean.txt"
+  train_npzs_list: "scripts/filter_ScannetPP_40/train_npzs_clean.txt"
+
+  val_imgs_list: ""
+  val_pkls_list: ""
+  val_npzs_list: ""
+
+
+# ===============================================================
+# 掩码配置 (全局共用)
+# ===============================================================
+masks:
+  train_mask_list: "/root/autodl-tmp/Inpainting/SfM_inpainting/data_list/irregular_mask_40_50.txt"
+  val_mask_list: "/root/autodl-tmp/Inpainting/SfM_inpainting/data_list/irregular_mask_40_50.txt"
