@@ -2,7 +2,7 @@ import logging
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from .transformer_RefKV import BlockAxial, SelfAttention, GELU
+from .transformer_RefKV import BlockAxial, GELU
 from torch.utils.checkpoint import checkpoint
 
 logger = logging.getLogger(__name__)
@@ -63,7 +63,6 @@ class GlobalCrossAttention(nn.Module):
 class HybridBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.ln1 = nn.LayerNorm(config.n_embd)
         self.ln2 = nn.LayerNorm(config.n_embd)
         self.ln3 = nn.LayerNorm(config.n_embd) # Cross Attn 用的 LN
         
@@ -285,16 +284,9 @@ class EdgeLineGPT256RelBCE(nn.Module):
 
     def extract_reference_features(self, 
                                    global_img=None, global_edge=None, global_line=None,
-                                   local_img=None, local_edge=None, local_line=None, local_mask=None,
-                                   local_conf=None):
+                                   local_img=None, local_edge=None, local_line=None, local_mask=None):
         """
         Build reference features for global + local references.
-
-        Scalar gate for local branch (residual-style):
-          - global ref tokens are always kept as-is
-          - local ref tokens are treated as an additional residual reference set and scaled by w
-        Gate:
-          w = sigmoid((conf - tau) / temp), with tau=0.30, temp=0.10
         """
         ref_list = []
 
@@ -311,7 +303,7 @@ class EdgeLineGPT256RelBCE(nn.Module):
             g_feat_final = g_feat_flat + self.type_emb_global        # [B, 256, 256]
             ref_list.append(g_feat_final)
 
-        # --- 2. Local Ref (No Pool 32x32) + Scalar Gate ---
+        # --- 2. Local Ref (No Pool 32x32) ---
         if local_img is not None or local_edge is not None:
             if local_img is None:
                 B, _, H, W = local_edge.shape
@@ -328,31 +320,6 @@ class EdgeLineGPT256RelBCE(nn.Module):
             # No Pooling
             l_feat_flat = l_feat.flatten(2).transpose(1, 2)          # [B, 1024, 256]
             l_feat_final = l_feat_flat + self.type_emb_local         # [B, 1024, 256]
-
-            # ---- scalar gate for local branch (residual-style: scale local tokens only) ----
-            if local_conf is not None:
-                # recommended gate params
-                tau = 0.30
-                temp = 0.10
-
-                dev = l_feat_final.device
-                conf = local_conf
-                if not torch.is_tensor(conf):
-                    conf = torch.tensor(conf, device=dev, dtype=torch.float32)
-                else:
-                    conf = conf.to(device=dev, dtype=torch.float32)
-
-                # shape normalize to [B]
-                if conf.dim() == 0:
-                    conf = conf.view(1).expand(B)
-                else:
-                    conf = conf.view(conf.shape[0])
-
-                conf = conf.clamp(0.0, 1.0)                          # [B]
-                w = torch.sigmoid((conf - tau) / temp)               # [B]
-                w = w.to(dtype=l_feat_final.dtype).view(B, 1, 1)     # [B,1,1] for broadcast
-
-                l_feat_final = l_feat_final * w
 
             ref_list.append(l_feat_final)
 
