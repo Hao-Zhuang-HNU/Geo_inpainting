@@ -249,7 +249,6 @@ class MaPDatasetWrapper(Dataset):
         # 1. 当前帧数据
         curr_item = self.dataset[idx]
         info = self.idx_info[idx]
-        current_conf = 0.0
         npz_ok = 0.0
         warp_valid = 0.0
         local_used = 0.0   # whether we actually use warped local ref
@@ -271,7 +270,7 @@ class MaPDatasetWrapper(Dataset):
         # [修改] 增加 no_align 逻辑分支
         if not info['is_first']:
             if self.no_align:
-                # 模式：不进行对齐，直接使用上一帧的原始数据，并强制置信度为1.0
+                # 模式：不进行对齐，直接使用上一帧的原始数据
                 try:
                     prev_geo = self._load_raw_geometry(info['prev_idx'])
                     # 不需要 warp，直接转 Tensor
@@ -279,7 +278,6 @@ class MaPDatasetWrapper(Dataset):
                     l_line_t = torch.from_numpy(prev_geo['line']).float().unsqueeze(0)
                     l_mask_t = torch.from_numpy(prev_geo['mask']).float().unsqueeze(0)
                     
-                    current_conf = 1.0 # 强制全通
                     warp_valid = 1.0
                     npz_ok = 1.0 # 模拟 npz 存在
                     valid_local = True
@@ -292,9 +290,8 @@ class MaPDatasetWrapper(Dataset):
                     warp_data = np.load(self.npz_path_list[idx])
                     npz_ok = 1.0
                     warp_valid = 1.0 if bool(warp_data.get('valid', False)) else 0.0
-                    current_conf = float(warp_data.get('confidence_iou', 0.0))
 
-                    if warp_valid > 0.5 and current_conf > 0.0:
+                    if warp_valid > 0.5:
                         prev_geo = self._load_raw_geometry(info['prev_idx'])
                         warped_raw = self._warp_geometry(
                             prev_geo, warp_data['homography'],
@@ -327,7 +324,6 @@ class MaPDatasetWrapper(Dataset):
             "l_edge": l_edge_t.contiguous(),
             "l_line": l_line_t.contiguous(),
             "l_mask": l_mask_t.contiguous(),
-            "conf": torch.tensor(current_conf, dtype=torch.float32),
 
             # [ADD] diagnostics outputs
             "npz_ok": torch.tensor(npz_ok, dtype=torch.float32),
@@ -482,13 +478,6 @@ def train_one_epoch_optimized(model, train_loader, dataset_obj, optimizer, devic
         l_edge = batch['l_edge'].to(device, non_blocking=True)
         l_line = batch['l_line'].to(device, non_blocking=True)
         l_mask = batch['l_mask'].to(device, non_blocking=True)
-        local_conf = batch.get("conf", None)  # [ADD] confidence_iou from npz
-        if local_conf is not None:
-            local_conf = local_conf.to(device=device, non_blocking=True, dtype=torch.float32)
-            #消融：如果启用 no_gate，强制将置信度设为 1.0 (全通)
-            if getattr(opts, "no_gate", False):
-                local_conf = torch.ones_like(local_conf)
-
         npz_ok = batch.get("npz_ok", None)
         warp_valid = batch.get("warp_valid", None)
         local_used = batch.get("local_used", None)
@@ -507,9 +496,6 @@ def train_one_epoch_optimized(model, train_loader, dataset_obj, optimizer, devic
         else:
             denom_nf = torch.tensor(float(B), device=device)
 
-        # [修改] 移除了原有的 known 区域掩码计算和 _binary_iou 实时计算代码
-        # 仅依赖从 batch 中读取的 local_conf (即 npz 中的 confidence_iou)
-
         # handle "empty line" cases (optional)
         empty_gt = (c_line.flatten(1).sum(1) == 0).float()
         empty_local = (l_line.flatten(1).sum(1) == 0).float()
@@ -522,22 +508,15 @@ def train_one_epoch_optimized(model, train_loader, dataset_obj, optimizer, devic
                 warp_valid_ratio = (warp_valid * non_first).sum() / denom_nf if warp_valid is not None else torch.tensor(0.0, device=device)
                 local_used_ratio = (local_used * non_first).sum() / denom_nf if local_used is not None else torch.tensor(0.0, device=device)
 
-                conf_nf = (local_conf * non_first) if local_conf is not None else None
-                conf_mean = conf_nf.sum() / denom_nf if conf_nf is not None else torch.tensor(0.0, device=device)
             else:
                 npz_ok_ratio = npz_ok.mean() if npz_ok is not None else torch.tensor(0.0, device=device)
                 warp_valid_ratio = warp_valid.mean() if warp_valid is not None else torch.tensor(0.0, device=device)
                 local_used_ratio = local_used.mean() if local_used is not None else torch.tensor(0.0, device=device)
-                conf_mean = local_conf.mean() if local_conf is not None else torch.tensor(0.0, device=device)
-
-            conf_min = local_conf.min() if local_conf is not None else torch.tensor(0.0, device=device)
-            conf_max = local_conf.max() if local_conf is not None else torch.tensor(0.0, device=device)
 
             # [修改] 日志字符串中移除了 iou_known 和 iou_all
             logger.info(
                 f"[Diag][Ep{epoch} It{it}] "
                 f"npz_ok={npz_ok_ratio.item():.3f} warp_valid={warp_valid_ratio.item():.3f} local_used={local_used_ratio.item():.3f} | "
-                f"conf(mean/min/max)={conf_mean.item():.3f}/{conf_min.item():.3f}/{conf_max.item():.3f} | "
                 f"empty_gt={float(empty_gt.mean().item()):.3f} empty_local={float(empty_local.mean().item()):.3f}"
             )
 
@@ -546,9 +525,6 @@ def train_one_epoch_optimized(model, train_loader, dataset_obj, optimizer, devic
                 writer.add_scalar("diag/npz_ok_ratio", float(npz_ok_ratio.item()), step)
                 writer.add_scalar("diag/warp_valid_ratio", float(warp_valid_ratio.item()), step)
                 writer.add_scalar("diag/local_used_ratio", float(local_used_ratio.item()), step)
-                writer.add_scalar("diag/conf_mean", float(conf_mean.item()), step)
-                writer.add_scalar("diag/conf_min", float(conf_min.item()), step)
-                writer.add_scalar("diag/conf_max", float(conf_max.item()), step)
                 # [修改] 移除了 diag/iou_known_mean 和 diag/iou_all_mean 的 TensorBoard 写入
             
         for t in [c_mask, c_edge, c_line, l_mask, l_edge, l_line, g_edge, g_line]:
@@ -559,8 +535,7 @@ def train_one_epoch_optimized(model, train_loader, dataset_obj, optimizer, devic
         with torch.amp.autocast('cuda', enabled=amp, dtype=torch.bfloat16):
             ref_feat = raw_model.extract_reference_features(
                 global_img=None, global_edge=g_edge, global_line=g_line,
-                local_img=None, local_edge=l_edge, local_line=l_line, local_mask=l_mask,
-                local_conf=local_conf  # [ADD] gate enabled here
+                local_img=None, local_edge=l_edge, local_line=l_line, local_mask=l_mask
             )
             
             edge_logits, line_logits = raw_model.forward_with_logits(
@@ -647,8 +622,6 @@ def train_one_epoch_optimized(model, train_loader, dataset_obj, optimizer, devic
         del l_edge, l_line, l_mask
         
         # 清理batch中的其他tensor
-        if local_conf is not None:
-            del local_conf
         if npz_ok is not None:
             del npz_ok, warp_valid, local_used, is_first
         
@@ -852,26 +825,18 @@ def evaluate_sequence(model, val_dataset, seq_to_ref, device, logger, amp, opts,
                 l_mask = torch.ones_like(t_mask)
                 warp_valid = False
                 H_mat = np.eye(3, dtype=np.float32)
-                local_conf = 0.0
                 is_no_align = getattr(opts, "no_align", False) #ablation
 
                 if is_no_align: #ablation
                     warp_valid = True
-                    local_conf = 1.0 # 强制全通
                 elif (p_idx >= 0) and (val_npz_list is not None):
                     try:
                         wd = np.load(val_npz_list[t_idx])
                         warp_valid = bool(wd.get("valid", False))
                         if warp_valid:
                             H_mat = wd["homography"]
-                            if "confidence_iou" in wd:
-                                local_conf = float(wd["confidence_iou"])
                     except Exception:
                         warp_valid = False
-                        local_conf = 0.0
-
-                if getattr(opts, "no_gate", False):
-                    local_conf = 1.0
 
                 if warp_valid and (p_idx >= 0):
                     try:
@@ -895,11 +860,9 @@ def evaluate_sequence(model, val_dataset, seq_to_ref, device, logger, amp, opts,
                         l_mask = torch.ones_like(t_mask)
 
                 with torch.amp.autocast('cuda', enabled=bool(amp), dtype=torch.bfloat16):
-                    local_conf_t = torch.tensor([local_conf], device=device, dtype=torch.float32)
                     ref_feat = raw_model.extract_reference_features(
                         global_img=None, global_edge=g_edge, global_line=g_line,
-                        local_img=None, local_edge=l_edge, local_line=l_line, local_mask=l_mask,
-                        local_conf=local_conf_t
+                        local_img=None, local_edge=l_edge, local_line=l_line, local_mask=l_mask
                     )
                     edge_logits, line_logits = raw_model.forward_with_logits(
                         img_idx=t_img, edge_idx=t_edge_gt, line_idx=t_line_gt, masks=t_mask, ref_feat=ref_feat
@@ -919,7 +882,7 @@ def evaluate_sequence(model, val_dataset, seq_to_ref, device, logger, amp, opts,
                     # 清理当前iteration的tensors
                     del g_edge, g_line, t_img, t_edge_gt, t_line_gt, t_mask
                     del l_edge, l_line, l_mask, ref_feat, edge_logits, line_logits
-                    del target_edge, target_line, local_conf_t
+                    del target_edge, target_line
                     continue
 
                 local_loss += float(loss.detach().cpu().item())  # 转到CPU
@@ -942,7 +905,7 @@ def evaluate_sequence(model, val_dataset, seq_to_ref, device, logger, amp, opts,
                 # 清理当前iteration的所有tensors
                 del g_edge, g_line, t_img, t_edge_gt, t_line_gt, t_mask
                 del l_edge, l_line, l_mask, ref_feat, edge_logits, line_logits
-                del target_edge, target_line, loss, local_conf_t
+                del target_edge, target_line, loss
                 if 'loss_edge' in locals():
                     del loss_edge
                 if 'loss_line' in locals():
