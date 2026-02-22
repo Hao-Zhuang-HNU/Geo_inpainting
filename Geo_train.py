@@ -560,7 +560,6 @@ def train_one_epoch_optimized(model, train_loader, dataset_obj, optimizer, devic
             ref_feat = raw_model.extract_reference_features(
                 global_img=None, global_edge=g_edge, global_line=g_line,
                 local_img=None, local_edge=l_edge, local_line=l_line, local_mask=l_mask,
-                local_conf=local_conf  # [ADD] gate enabled here
             )
             
             edge_logits, line_logits = raw_model.forward_with_logits(
@@ -898,7 +897,6 @@ def evaluate_sequence(model, val_dataset, seq_to_ref, device, logger, amp, opts,
                     ref_feat = raw_model.extract_reference_features(
                         global_img=None, global_edge=g_edge, global_line=g_line,
                         local_img=None, local_edge=l_edge, local_line=l_line, local_mask=l_mask,
-                        local_conf=local_conf_t
                     )
                     edge_logits, line_logits = raw_model.forward_with_logits(
                         img_idx=t_img, edge_idx=t_edge_gt, line_idx=t_line_gt, masks=t_mask, ref_feat=ref_feat
