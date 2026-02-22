@@ -271,13 +271,13 @@ class MaPDatasetWrapper(Dataset):
         # [修改] 增加 no_align 逻辑分支
         if not info['is_first']:
             if self.no_align:
-                # 模式：不进行对齐，直接使用上一帧的原始数据，并强制置信度为1.0
+                # 模式：不进行对齐，直接使用当前帧 GT 作为 local reference
                 try:
-                    prev_geo = self._load_raw_geometry(info['prev_idx'])
-                    # 不需要 warp，直接转 Tensor
-                    l_edge_t = torch.from_numpy(prev_geo['edge']).float().unsqueeze(0)
-                    l_line_t = torch.from_numpy(prev_geo['line']).float().unsqueeze(0)
-                    l_mask_t = torch.from_numpy(prev_geo['mask']).float().unsqueeze(0)
+                    l_edge_t = curr_item['edge'].clone()
+                    l_line_t = curr_item['line'].clone()
+                    l_mask_t = torch.zeros_like(curr_item['mask'])
+                    if l_mask_t.dim() == 2:
+                        l_mask_t = l_mask_t.unsqueeze(0)
                     
                     current_conf = 1.0 # 强制全通
                     warp_valid = 1.0
@@ -875,16 +875,15 @@ def evaluate_sequence(model, val_dataset, seq_to_ref, device, logger, amp, opts,
 
                 if warp_valid and (p_idx >= 0):
                     try:
-                        meta_prev = val_dataset[p_idx]
-                        prev_edge_gt = _ensure_4d_float(meta_prev["edge"], device)
-                        prev_line_gt = _ensure_4d_float(meta_prev["line"], device)
-
                         if is_no_align:
-                            # [修改] 直接使用上一帧，不进行 Warp
-                            l_edge = prev_edge_gt
-                            l_line = prev_line_gt
-                            l_mask = torch.zeros_like(t_mask) # 假设全图有效
+                            # [修改] 直接使用当前帧 GT，不进行 Warp
+                            l_edge = t_edge_gt
+                            l_line = t_line_gt
+                            l_mask = torch.zeros_like(t_mask) # 全图有效
                         else:
+                            meta_prev = val_dataset[p_idx]
+                            prev_edge_gt = _ensure_4d_float(meta_prev["edge"], device)
+                            prev_line_gt = _ensure_4d_float(meta_prev["line"], device)
                             # 原有的 Warp 逻辑
                             l_edge = warp_tensor(prev_edge_gt, H_mat)
                             l_line = warp_tensor(prev_line_gt, H_mat)
