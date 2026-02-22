@@ -60,6 +60,7 @@ from datasets.dataset_TSR import (
 )
 from src.models.TSR_model_RefKV import EdgeLineGPT256RelBCE, EdgeLineGPTConfig
 from src.utils_RefKV import set_seed
+from datasets.check_ref_frame import run_check_ref_frame
 
 import cv2
 import numpy as np
@@ -1282,6 +1283,14 @@ def main_worker(opts):
         )
         rebuild_seq_indices(val_dataset, "Val")
 
+    if getattr(opts, "check_ref_frame", False):
+        if is_main:
+            logger.info("[CheckRef] --check_ref_frame is enabled. Running reference-frame consistency check only.")
+            run_check_ref_frame(opts, train_loader.dataset, logger)
+        if opts.dist:
+            dist.barrier()
+        return
+
     # =========================================================
     #  [MODIFICATION] PRE-CALCULATE FIXED VALIDATION FRAMES HERE
     # =========================================================
@@ -1394,6 +1403,10 @@ if __name__ == "__main__":
 
     #消融指标
     parser.add_argument("--no_align", action="store_true", help="Do not align reference frames (use raw previous) and force IOU to 1.0")
+    parser.add_argument("--check_ref_frame", action="store_true", help="Run reference-frame Chamfer check and exit")
+    parser.add_argument("--check_ref_frame_dir", type=str, default="check_ref_frame", help="Output directory for ref-frame check")
+    parser.add_argument("--check_ref_frame_step", type=int, default=1000, help="Save one visualization every N frames")
+    parser.add_argument("--check_ref_frame_random_samples", type=int, default=20, help="Additional random visualization count")
 
 
     opts = parser.parse_args()
