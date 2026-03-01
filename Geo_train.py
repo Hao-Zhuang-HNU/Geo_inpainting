@@ -179,11 +179,13 @@ def append_simple_log(ckpt_path, message):
         f.write(message + "\n")
 
 
-def dump_debug_line_panels(dataset, seq_to_indices, out_dir="debug_line", frames_per_seq=10, logger=None):
+def dump_debug_line_panels(dataset, seq_to_indices, out_dir="debug_line", frames_per_seq=10, logger=None,
+                           no_align=False, no_global_ref=False, no_local_ref=False):
     """
     For each sequence, sample up to `frames_per_seq` frames and dump a concatenated panel:
     [local_ref_line | global_ref_line | frame_line].
     All line maps are loaded via dataset.load_wireframe to ensure consistency.
+    no_align=True: local_ref_line uses current frame line (GT) to match training no_align branch.
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -220,7 +222,7 @@ def dump_debug_line_panels(dataset, seq_to_indices, out_dir="debug_line", frames
             sample_pos = np.unique(sample_pos)
 
         global_idx = sorted_idxs[0]
-        global_line = _load_line_by_idx(global_idx)
+        global_line = np.zeros((image_size, image_size, 3), dtype=np.uint8) if no_global_ref else _load_line_by_idx(global_idx)
 
         safe_seq = str(seq_id).replace(os.sep, "_").replace(" ", "_")[:120]
         seq_out_dir = os.path.join(out_dir, safe_seq)
@@ -231,7 +233,11 @@ def dump_debug_line_panels(dataset, seq_to_indices, out_dir="debug_line", frames
             curr_idx = sorted_idxs[pos]
             curr_line = _load_line_by_idx(curr_idx)
 
-            if pos > 0:
+            if no_local_ref:
+                local_line = np.zeros_like(curr_line)
+            elif no_align:
+                local_line = curr_line.copy()
+            elif pos > 0:
                 local_idx = sorted_idxs[pos - 1]
                 local_line = _load_line_by_idx(local_idx)
             else:
@@ -1395,6 +1401,9 @@ def main_worker(opts):
             out_dir=debug_line_dir,
             frames_per_seq=10,
             logger=logger,
+            no_align=getattr(opts, "no_align", False),
+            no_global_ref=getattr(opts, "no_global_ref", False),
+            no_local_ref=getattr(opts, "no_local_ref", False),
         )
 
     if getattr(opts, "check_ref_frame", False):
