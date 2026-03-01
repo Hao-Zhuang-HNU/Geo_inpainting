@@ -1148,29 +1148,26 @@ def main_worker(opts):
     os.makedirs(opts.ckpt_path, exist_ok=True)
     logger = build_logger(opts.ckpt_path)
     
+    ## 多卡环境导入（等待30分钟）
     if opts.dist:
             local_rank = int(os.environ.get("LOCAL_RANK", "0"))
             rank = int(os.environ.get("RANK", "0"))
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
-
-            # [修改] 引入 datetime 并设置 timeout 为 30 分钟
             import datetime
             dist.init_process_group(
                 backend="nccl", 
                 init_method="env://", 
-                timeout=datetime.timedelta(minutes=30) # 增加超时容忍度
+                timeout=datetime.timedelta(minutes=30)
             )
             torch.cuda.set_device(local_rank)
             device = torch.device(f"cuda:{local_rank}")
     else:
         local_rank, rank, world_size = 0, 0, 1
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
     opts.rank = rank
     opts.world_size = world_size
     opts.local_rank = local_rank
     is_main = (rank == 0)
-    
     if is_main:
         logger.info(f"[SYS] Device: {device} | DDP: {opts.dist} | GPUs: {world_size}")
         if opts.config_path:
@@ -1178,14 +1175,13 @@ def main_worker(opts):
             with open(os.path.join(opts.ckpt_path, "config.yml"), "w") as f:
                 yaml.dump(opts.yaml_cfg, f)
 
-    # ... (Helpers: read_list_file, combine_datasets_from_yaml, save_temp_list - OMITTED FOR BREVITY, SAME AS BEFORE) ...
     def read_list_file(path):
+        ## 清单文件函数定义
         if not path or not os.path.isfile(path): return []
         with open(path, 'r') as f: return [line.strip() for line in f.readlines() if line.strip()]
 
     def combine_datasets_from_yaml(cfg, mode='train'):
-        # ... (Same as original code) ...
-        # (This block is large and unchanged, imagine it is here)
+        ## 在yaml的dataset1, dataset2中依次读取词条img_list, pkl_list, npz_list
         def get_seq_id(path):
             try:
                 norm_path = os.path.normpath(path)
@@ -1195,54 +1191,43 @@ def main_worker(opts):
                     if len(part) > 15: return part
                 return os.path.dirname(norm_path)
             except: return os.path.dirname(path)
-
         dataset_info_list = []
         for ds_key in ['dataset1', 'dataset2']:
             ds = cfg.get(ds_key, {})
             if not ds.get('enable', False): continue
-            
             prefix = f"{mode}_"
             img_list = read_list_file(ds.get(f"{prefix}imgs_list"))
             pkl_list = read_list_file(ds.get(f"{prefix}pkls_list"))
             npz_list = read_list_file(ds.get(f"{prefix}npzs_list"))
-            
             if not img_list: continue
-            
             seq_groups = collections.defaultdict(lambda: {'img': [], 'pkl': [], 'npz': []})
             has_npz = (len(npz_list) == len(img_list))
-
             for i, img_path in enumerate(img_list):
                 sid = get_seq_id(img_path)
                 seq_groups[sid]['img'].append(img_path)
                 seq_groups[sid]['pkl'].append(pkl_list[i])
                 if has_npz: seq_groups[sid]['npz'].append(npz_list[i])
-            
             dataset_info_list.append({
                 'name': ds.get('name', ds_key),
                 'seq_groups': seq_groups,
                 'seq_count': len(seq_groups),
                 'ratio': float(ds.get('ratio', 1.0))
             })
-
         if not dataset_info_list: return [], [], []
-
         final_img, final_pkl, final_npz = [], [], []
-        
-        # ... logic for ratio mixing ... (omitted for brevity, assume original logic)
         for d in dataset_info_list:
              for sid in sorted(list(d['seq_groups'].keys())):
                 group = d['seq_groups'][sid]
                 final_img.extend(group['img'])
                 final_pkl.extend(group['pkl'])
                 final_npz.extend(group['npz'])
-
         return final_img, final_pkl, final_npz
-    # ... (End of helpers) ...
 
-    # ... (Temp file writing & Dataset building) ...
+    ## 临时列表和数据集文件的建立，减少内存占用
     temp_dir = os.path.join(opts.ckpt_path, "temp_lists")
     os.makedirs(temp_dir, exist_ok=True)
     def save_temp_list(data, name):
+        ## 把列表写到ckpt_path/temp_lists/*.txt，减少内存占用
         p = os.path.join(temp_dir, name)
         with open(p, 'w') as f: f.write('\n'.join(data))
         return p
@@ -1263,9 +1248,7 @@ def main_worker(opts):
 
         
         
-    # =========================================================
-    #  [ADD] Pre-training File Existence Check
-    # =========================================================
+    ## 数据路径健壮性检查，防止训练中途路径报错
     if is_main:
         logger.info("="*20 + " [Sanity Check] Validating Dataset Paths " + "="*20)
         
@@ -1298,17 +1281,12 @@ def main_worker(opts):
             else:
                 logger.info(f"[Check] PASSED: All files in {list_name} exist.")
 
-        # 检查训练集图片
         _validate_file_list("Train Images", opts.data_path)
-        # 检查训练集线框 (PKL)
         _validate_file_list("Train Wireframes", opts.train_wireframes_list)
-        # 检查验证集图片
         _validate_file_list("Val Images", opts.validation_path)
         
-        # 检查 NPZ (如果是 YAML 模式，train_npz_list 是文件路径列表；如果是 CLI 模式，可能是列表文件的路径)
-        # 为了安全起见，这里仅简单检查列表中的第一项是否为有效路径
         if train_npz_list and len(train_npz_list) > 0:
-             # 如果列表第一项是一个存在的 .npz 文件，说明这是一个直接的路径列表，检查前5个即可(避免IO过重)
+             # 如果列表第一项是一个存在的 .npz 文件，说明这是一个直接的路径列表，检查前5个即可
              # 如果列表第一项是一个存在的 .txt 文件，说明这是列表文件
             first_item = train_npz_list[0]
             if os.path.isfile(first_item):
@@ -1320,10 +1298,9 @@ def main_worker(opts):
                         if not os.path.exists(p):
                             raise FileNotFoundError(f"Missing NPZ file: {p}")
                     logger.info(f"[Check] PASSED: Train NPZ sample check.")
-        
         logger.info("="*60)
-    # =========================================================
 
+    ## 建立训练集、验证集
     train_loader, val_dataset, train_sampler, train_base_ds = build_datasets_and_loader(
         opts, logger, train_npz_list=train_npz_list
     )
@@ -1393,6 +1370,7 @@ def main_worker(opts):
         )
         rebuild_seq_indices(val_dataset, "Val")
 
+    ## 若开启debug_line，导出可视化线框
     if is_main and getattr(opts, "debug_line", False):
         debug_line_dir = getattr(opts, "debug_line_dir", "debug_line")
         dump_debug_line_panels(
@@ -1406,6 +1384,7 @@ def main_worker(opts):
             no_local_ref=getattr(opts, "no_local_ref", False),
         )
 
+    ## 若开启check_ref_frame，运行参考帧一致性检查（rgb图片），且不进入训练
     if getattr(opts, "check_ref_frame", False):
         if is_main:
             logger.info("[CheckRef] --check_ref_frame is enabled. Running reference-frame consistency check only.")
