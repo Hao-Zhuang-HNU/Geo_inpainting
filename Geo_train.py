@@ -183,12 +183,15 @@ def append_simple_log(ckpt_path, message):
 # ============================================================
 
 class MaPDatasetWrapper(Dataset):
-    def __init__(self, dataset, seq_to_indices, npz_path_list=None, logger=None, no_align=False):
+    def __init__(self, dataset, seq_to_indices, npz_path_list=None, logger=None, no_align=False,
+                 no_global_ref=False, no_local_ref=False):
         self.dataset = dataset
         self.seq_to_indices = seq_to_indices
         self.npz_path_list = npz_path_list
         self.logger = logger
         self.no_align = no_align  # ablation
+        self.no_global_ref = no_global_ref
+        self.no_local_ref = no_local_ref
         self.idx_to_seq = {}
         self.idx_info = {} 
         
@@ -257,7 +260,10 @@ class MaPDatasetWrapper(Dataset):
         is_first = 1.0 if info['is_first'] else 0.0
         
         # 2. Global Ref 数据
-        if idx == info['global_idx']:
+        if self.no_global_ref:
+            g_edge = torch.zeros_like(curr_item['edge'])
+            g_line = torch.zeros_like(curr_item['line'])
+        elif idx == info['global_idx']:
             g_edge = curr_item['edge']
             g_line = curr_item['line']
         else:
@@ -270,7 +276,9 @@ class MaPDatasetWrapper(Dataset):
         valid_local = False
 
         # [修改] 增加 no_align 逻辑分支
-        if not info['is_first']:
+        if self.no_local_ref:
+            valid_local = False
+        elif not info['is_first']:
             if self.no_align:
                 # 模式：不进行对齐，直接使用当前帧 GT 作为 local reference
                 try:
@@ -354,7 +362,9 @@ def build_datasets_and_loader(opts, logger, train_npz_list=None):
         base_dataset.seq_to_indices, 
         npz_path_list=train_npz_list, 
         logger=logger,
-        no_align=getattr(opts, "no_align", False)  # ablation
+        no_align=getattr(opts, "no_align", False),  # ablation
+        no_global_ref=getattr(opts, "no_global_ref", False),
+        no_local_ref=getattr(opts, "no_local_ref", False),
     )
     
     rank = int(getattr(opts, "rank", 0))
@@ -837,6 +847,9 @@ def evaluate_sequence(model, val_dataset, seq_to_ref, device, logger, amp, opts,
                 _, g_edge, g_line = _build_clean_ref_sample(
                     val_dataset, g_idx, getattr(opts, "image_size", 256), device
                 )
+                if getattr(opts, "no_global_ref", False):
+                    g_edge = torch.zeros_like(g_edge)
+                    g_line = torch.zeros_like(g_line)
 
                 # Target frame
                 meta_tgt = val_dataset[t_idx]
@@ -855,7 +868,10 @@ def evaluate_sequence(model, val_dataset, seq_to_ref, device, logger, amp, opts,
                 local_conf = 0.0
                 is_no_align = getattr(opts, "no_align", False) #ablation
 
-                if is_no_align: #ablation
+                if getattr(opts, "no_local_ref", False):
+                    warp_valid = False
+                    local_conf = 0.0
+                elif is_no_align: #ablation
                     warp_valid = True
                     local_conf = 1.0 # 强制全通
                 elif (p_idx >= 0) and (val_npz_list is not None):
@@ -1022,6 +1038,8 @@ def load_config_to_opts(opts):
 
     # 消融指标
     if 'no_align' in tp: opts.no_align = bool(tp['no_align'])
+    if 'no_global_ref' in tp: opts.no_global_ref = bool(tp['no_global_ref'])
+    if 'no_local_ref' in tp: opts.no_local_ref = bool(tp['no_local_ref'])
 
     
     # Store cfg for dataset loading in main
@@ -1403,6 +1421,8 @@ if __name__ == "__main__":
 
     #消融指标
     parser.add_argument("--no_align", action="store_true", help="Do not align reference frames (use raw previous) and force IOU to 1.0")
+    parser.add_argument("--no_global_ref", action="store_true", help="Do not use global reference frame; replace with empty tensors")
+    parser.add_argument("--no_local_ref", action="store_true", help="Do not use local reference frame; replace with empty tensors")
     parser.add_argument("--check_ref_frame", action="store_true", help="Run reference-frame Chamfer check and exit")
     parser.add_argument("--check_ref_frame_dir", type=str, default="check_ref_frame", help="Output directory for ref-frame check")
     parser.add_argument("--check_ref_frame_step", type=int, default=1000, help="Save one visualization every N frames")
