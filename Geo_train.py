@@ -178,6 +178,72 @@ def append_simple_log(ckpt_path, message):
     with open(os.path.join(ckpt_path, "simplified_log.txt"), "a") as f:
         f.write(message + "\n")
 
+
+def dump_debug_line_panels(dataset, seq_to_indices, out_dir="debug_line", frames_per_seq=10, logger=None):
+    """
+    For each sequence, sample up to `frames_per_seq` frames and dump a concatenated panel:
+    [local_ref_line | global_ref_line | frame_line].
+    All line maps are loaded via dataset.load_wireframe to ensure consistency.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    image_size = int(getattr(dataset, "image_size", 256))
+
+    def _load_line_by_idx(frame_idx):
+        img_path = dataset.image_id_list[frame_idx]
+        basename = os.path.splitext(os.path.basename(img_path))[0]
+        line = dataset.load_wireframe(basename, image_size)
+        if line is None:
+            line = np.zeros((image_size, image_size), dtype=np.float32)
+        line = np.asarray(line, dtype=np.float32)
+        if line.ndim == 3:
+            line = line[..., 0]
+        line = np.clip(line, 0.0, 1.0)
+        u8 = (line * 255.0).astype(np.uint8)
+        return cv2.cvtColor(u8, cv2.COLOR_GRAY2BGR)
+
+    for seq_id, idxs in seq_to_indices.items():
+        try:
+            paths = [dataset.image_id_list[i] for i in idxs]
+            sorted_pairs = sorted(zip(paths, idxs), key=lambda x: x[0])
+            sorted_idxs = [p[1] for p in sorted_pairs]
+        except Exception:
+            sorted_idxs = sorted(idxs)
+
+        if len(sorted_idxs) == 0:
+            continue
+
+        if len(sorted_idxs) <= frames_per_seq:
+            sample_pos = np.arange(len(sorted_idxs), dtype=np.int64)
+        else:
+            sample_pos = np.linspace(0, len(sorted_idxs) - 1, frames_per_seq, dtype=np.int64)
+            sample_pos = np.unique(sample_pos)
+
+        global_idx = sorted_idxs[0]
+        global_line = _load_line_by_idx(global_idx)
+
+        safe_seq = str(seq_id).replace(os.sep, "_").replace(" ", "_")[:120]
+        seq_out_dir = os.path.join(out_dir, safe_seq)
+        os.makedirs(seq_out_dir, exist_ok=True)
+
+        for pos in sample_pos:
+            pos = int(pos)
+            curr_idx = sorted_idxs[pos]
+            curr_line = _load_line_by_idx(curr_idx)
+
+            if pos > 0:
+                local_idx = sorted_idxs[pos - 1]
+                local_line = _load_line_by_idx(local_idx)
+            else:
+                local_line = np.zeros_like(curr_line)
+
+            panel = cv2.hconcat([local_line, global_line, curr_line])
+            save_name = f"{pos:03d}_idx{curr_idx:06d}.png"
+            cv2.imwrite(os.path.join(seq_out_dir, save_name), panel)
+
+    if logger is not None:
+        logger.info(f"[DebugLine] Saved line panels to: {out_dir}")
+
 # ============================================================
 #  Dataset Components
 # ============================================================
@@ -1056,6 +1122,8 @@ def load_config_to_opts(opts):
     if 'no_align' in tp: opts.no_align = bool(tp['no_align'])
     if 'no_global_ref' in tp: opts.no_global_ref = bool(tp['no_global_ref'])
     if 'no_local_ref' in tp: opts.no_local_ref = bool(tp['no_local_ref'])
+    if 'debug_line' in tp: opts.debug_line = bool(tp['debug_line'])
+    if 'debug_line_dir' in tp: opts.debug_line_dir = str(tp['debug_line_dir'])
 
     
     # Store cfg for dataset loading in main
@@ -1282,7 +1350,9 @@ def main_worker(opts):
             new_train_map, 
             npz_path_list=train_npz_list, 
             logger=logger,
-            no_align=getattr(opts, "no_align", False) # ablation
+            no_align=getattr(opts, "no_align", False), # ablation
+            no_global_ref=getattr(opts, "no_global_ref", False),
+            no_local_ref=getattr(opts, "no_local_ref", False),
         )
                 # [DDP Fix] Distribute by frame-level "clips" rather than by sequences.
         rank = int(getattr(opts, "rank", 0))
@@ -1316,6 +1386,16 @@ def main_worker(opts):
             drop_last=False,
         )
         rebuild_seq_indices(val_dataset, "Val")
+
+    if is_main and getattr(opts, "debug_line", False):
+        debug_line_dir = getattr(opts, "debug_line_dir", "debug_line")
+        dump_debug_line_panels(
+            train_base_ds,
+            train_base_ds.seq_to_indices,
+            out_dir=debug_line_dir,
+            frames_per_seq=10,
+            logger=logger,
+        )
 
     if getattr(opts, "check_ref_frame", False):
         if is_main:
@@ -1439,6 +1519,8 @@ if __name__ == "__main__":
     parser.add_argument("--no_align", action="store_true", help="Do not align reference frames (use raw previous) and force IOU to 1.0")
     parser.add_argument("--no_global_ref", action="store_true", help="Do not use global reference frame; replace with empty tensors")
     parser.add_argument("--no_local_ref", action="store_true", help="Do not use local reference frame; replace with empty tensors")
+    parser.add_argument("--debug_line", action="store_true", help="Dump local/global/current line panels for each sequence to local directory")
+    parser.add_argument("--debug_line_dir", type=str, default="debug_line", help="Output directory for --debug_line panels")
     parser.add_argument("--check_ref_frame", action="store_true", help="Run reference-frame Chamfer check and exit")
     parser.add_argument("--check_ref_frame_dir", type=str, default="check_ref_frame", help="Output directory for ref-frame check")
     parser.add_argument("--check_ref_frame_step", type=int, default=1000, help="Save one visualization every N frames")
