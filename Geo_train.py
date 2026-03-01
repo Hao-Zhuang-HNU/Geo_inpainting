@@ -389,12 +389,26 @@ class MaPDatasetWrapper(Dataset):
                 except Exception:
                     pass
 
-        if not valid_local:
+        # Keep a small reference-dropout ratio to avoid over-reliance on local reference
+        # and reduce train/infer exposure bias.
+        if (not valid_local) or (self.dataset.is_train and random.random() < 0.2):
             l_edge_t = torch.zeros_like(curr_item['edge'])
             l_line_t = torch.zeros_like(curr_item['line'])
             l_mask_t = torch.ones_like(curr_item['mask'])
             if l_mask_t.dim() == 2:
                 l_mask_t = l_mask_t.unsqueeze(0)
+
+        # Simulate mild local-reference noise during training to improve robustness.
+        if self.dataset.is_train and valid_local:
+            if random.random() < 0.5:
+                if random.random() < 0.6:
+                    sigma = random.uniform(0.5, 1.0)
+                    l_edge_t = T.GaussianBlur(kernel_size=5, sigma=sigma)(l_edge_t)
+                    l_line_t = T.GaussianBlur(kernel_size=5, sigma=sigma)(l_line_t)
+                else:
+                    scale = random.uniform(0.6, 0.9)
+                    l_edge_t = l_edge_t * scale
+                    l_line_t = l_line_t * scale
 
         seq_hash = hash(str(info['seq_id']))
 
@@ -640,6 +654,12 @@ def train_one_epoch_optimized(model, train_loader, dataset_obj, optimizer, devic
         for t in [c_mask, c_edge, c_line, l_mask, l_edge, l_line, g_edge, g_line]:
             if t.dim() == 3: t.unsqueeze_(1)
 
+        if getattr(opts, "ref_dilate", 1) > 1:
+            g_edge = dilate_tensor(g_edge, opts.ref_dilate)
+            g_line = dilate_tensor(g_line, opts.ref_dilate)
+            l_edge = dilate_tensor(l_edge, opts.ref_dilate)
+            l_line = dilate_tensor(l_line, opts.ref_dilate)
+
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast('cuda', enabled=amp, dtype=torch.bfloat16):
@@ -668,6 +688,11 @@ def train_one_epoch_optimized(model, train_loader, dataset_obj, optimizer, devic
             else:
                 loss_edge = criterion(edge_logits, target_edge)
                 loss = (loss_edge + loss_line)
+
+            # Keep confidence-aware sample weighting from the original training script.
+            if local_conf is not None:
+                loss_weight = 1.0 + local_conf.mean().item()
+                loss = loss * loss_weight
         
         if torch.isnan(loss) or torch.isinf(loss):
             # 将 loss 抹零，使其产生 全0梯度，参与 DDP 同步
@@ -686,7 +711,7 @@ def train_one_epoch_optimized(model, train_loader, dataset_obj, optimizer, devic
             if should_log:
                 try:
                     curr_orig_idx = batch['orig_idx'][0].item()
-                    seq_id_val = train_wrapper.idx_to_seq.get(curr_orig_idx, "unknown")
+                    seq_id_val = train_loader.dataset.idx_to_seq.get(curr_orig_idx, "unknown")
                     seq_name = str(seq_id_val)[:10]
                 except:
                     seq_name = "unknown"
