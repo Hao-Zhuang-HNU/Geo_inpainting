@@ -24,6 +24,7 @@ training_params:
   disable_edge: True
   accumulation_steps: 2  # 梯度累积补偿小 batch
   no_align: True
+  no_global_ref: True
 
 # ===============================================================
 # 数据集 1: DL3DV
