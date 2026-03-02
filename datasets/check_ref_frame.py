@@ -36,26 +36,83 @@ def _chamfer_distance_binary(a_bin: np.ndarray, b_bin: np.ndarray) -> float:
     return 0.5 * (d_ab + d_ba)
 
 
-def _read_rgb(image_path: str, image_size: int) -> np.ndarray:
-    img = cv2.imread(image_path)
-    if img is None:
-        return np.zeros((image_size, image_size, 3), dtype=np.uint8)
-    img = cv2.resize(img, (image_size, image_size), interpolation=cv2.INTER_AREA)
-    return img
+def _tensor_to_gray_u8(x: torch.Tensor) -> np.ndarray:
+    """Convert [1,H,W] / [H,W] tensor in [0,1] to uint8 gray image."""
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().float().numpy()
+    x = np.squeeze(x)
+    if x.ndim != 2:
+        raise ValueError(f"Expected 2D tensor/map, got shape={x.shape}")
+    x = np.clip(x, 0.0, 1.0)
+    return (x * 255.0).astype(np.uint8)
 
 
-def _build_triptych(curr_img: np.ndarray, g_img: np.ndarray, l_img: np.ndarray, text_lines: List[str]) -> np.ndarray:
-    vis = np.concatenate([curr_img, g_img, l_img], axis=1)
+def _gray_to_bgr(x: np.ndarray) -> np.ndarray:
+    if x.ndim != 2:
+        raise ValueError(f"Expected [H,W] gray image, got shape={x.shape}")
+    return cv2.cvtColor(x, cv2.COLOR_GRAY2BGR)
+
+
+def _build_wireframe_panel(item: Dict[str, torch.Tensor], text_lines: List[str]) -> np.ndarray:
+    """Build a 3x3 panel from tensors actually consumed by the model.
+
+    Columns: current / global ref / local ref
+    Rows: line / edge / mask
+    """
+    c_line = _tensor_to_gray_u8(item["c_line"])
+    g_line = _tensor_to_gray_u8(item["g_line"])
+    l_line = _tensor_to_gray_u8(item["l_line"])
+
+    c_edge = _tensor_to_gray_u8(item["c_edge"])
+    g_edge = _tensor_to_gray_u8(item["g_edge"])
+    l_edge = _tensor_to_gray_u8(item["l_edge"])
+
+    c_mask = _tensor_to_gray_u8(item["c_mask"])
+    l_mask = _tensor_to_gray_u8(item["l_mask"])
+    g_mask = np.zeros_like(c_mask)  # global branch does not take global mask
+
+    row1 = cv2.hconcat([_gray_to_bgr(c_line), _gray_to_bgr(g_line), _gray_to_bgr(l_line)])
+    row2 = cv2.hconcat([_gray_to_bgr(c_edge), _gray_to_bgr(g_edge), _gray_to_bgr(l_edge)])
+    row3 = cv2.hconcat([_gray_to_bgr(c_mask), _gray_to_bgr(g_mask), _gray_to_bgr(l_mask)])
+    vis = cv2.vconcat([row1, row2, row3])
+
     y = 24
     for t in text_lines:
         cv2.putText(vis, t, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2, cv2.LINE_AA)
         y += 24
+    cv2.putText(vis, "Cols: Current | GlobalRef | LocalRef", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 0), 2, cv2.LINE_AA)
+    y += 24
+    cv2.putText(vis, "Rows: Line | Edge | Mask", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 0), 2, cv2.LINE_AA)
     return vis
+
+
+def _save_model_input_npz(item: Dict[str, torch.Tensor], out_path: str) -> None:
+    """Save concatenated geometry inputs used by model to local npz."""
+    cat = torch.cat(
+        [
+            item["c_edge"], item["c_line"], item["c_mask"],
+            item["g_edge"], item["g_line"],
+            item["l_edge"], item["l_line"], item["l_mask"],
+        ],
+        dim=0,
+    )
+    np.savez_compressed(
+        out_path,
+        model_input_cat=cat.detach().cpu().float().numpy(),
+        c_edge=item["c_edge"].detach().cpu().float().numpy(),
+        c_line=item["c_line"].detach().cpu().float().numpy(),
+        c_mask=item["c_mask"].detach().cpu().float().numpy(),
+        g_edge=item["g_edge"].detach().cpu().float().numpy(),
+        g_line=item["g_line"].detach().cpu().float().numpy(),
+        l_edge=item["l_edge"].detach().cpu().float().numpy(),
+        l_line=item["l_line"].detach().cpu().float().numpy(),
+        l_mask=item["l_mask"].detach().cpu().float().numpy(),
+    )
 
 
 def run_check_ref_frame(opts, train_wrapper, logger) -> Dict[str, float]:
     """Validate global/local ref frame geometry against current GT by Chamfer Distance.
-    Output summary CSV + sampled triptychs to opts.check_ref_frame_dir.
+    Output summary CSV + sampled model-input visualizations to opts.check_ref_frame_dir.
     """
     out_dir = getattr(opts, "check_ref_frame_dir", "check_ref_frame")
     step = int(getattr(opts, "check_ref_frame_step", 1000))
@@ -102,26 +159,15 @@ def run_check_ref_frame(opts, train_wrapper, logger) -> Dict[str, float]:
         ))
 
         if idx in vis_ids:
-            c_path = train_wrapper.dataset.image_id_list[idx]
             g_idx = int(info.get("global_idx", idx))
-            g_path = train_wrapper.dataset.image_id_list[g_idx]
-            if bool(info.get("is_first", False)):
-                l_path = c_path
-            else:
-                p_idx = int(info.get("prev_idx", idx))
-                p_idx = p_idx if p_idx >= 0 else idx
-                l_path = train_wrapper.dataset.image_id_list[p_idx]
-
-            c_img = _read_rgb(c_path, train_wrapper.dataset.image_size)
-            g_img = _read_rgb(g_path, train_wrapper.dataset.image_size)
-            l_img = _read_rgb(l_path, train_wrapper.dataset.image_size)
             text = [
                 f"idx={idx} global={g_idx} prev={info.get('prev_idx', -1)}",
                 f"line CD: curr-global={cd_g_line:.4f}, curr-local={cd_l_line:.4f}",
                 f"edge CD: curr-global={cd_g_edge:.4f}, curr-local={cd_l_edge:.4f}",
             ]
-            vis = _build_triptych(c_img, g_img, l_img, text)
+            vis = _build_wireframe_panel(item, text)
             cv2.imwrite(os.path.join(out_dir, f"ref_check_{idx:06d}.jpg"), vis)
+            _save_model_input_npz(item, os.path.join(out_dir, f"model_input_{idx:06d}.npz"))
 
     csv_path = os.path.join(out_dir, "chamfer_report.csv")
     with open(csv_path, "w", encoding="utf-8") as f:
@@ -147,4 +193,3 @@ def run_check_ref_frame(opts, train_wrapper, logger) -> Dict[str, float]:
     )
     logger.info(f"[CheckRef] CSV saved to: {csv_path}")
     return summary
-
