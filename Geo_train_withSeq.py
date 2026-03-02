@@ -11,7 +11,7 @@ import yaml
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -253,6 +253,54 @@ def dump_debug_line_panels(dataset, seq_to_indices, out_dir="debug_line", frames
 # ============================================================
 #  Dataset Components
 # ============================================================
+
+
+
+class GroupedSequenceSampler(Sampler):
+    """Sequence-grouped sampler (TSR-like): keep sequence locality in each mini-batch."""
+    def __init__(self, seq_to_indices, batch_size, rank=0, world_size=1, seed=42):
+        self.seq_to_indices = seq_to_indices
+        self.batch_size = int(batch_size)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.seed = int(seed)
+        self.epoch = 0
+
+        all_seq_keys = sorted(list(seq_to_indices.keys()))
+        self.rank_lengths = collections.defaultdict(int)
+        for i, k in enumerate(all_seq_keys):
+            r = i % max(self.world_size, 1)
+            self.rank_lengths[r] += len(seq_to_indices[k])
+        self.max_length = max(self.rank_lengths.values()) if len(self.rank_lengths) > 0 else 0
+
+    def __len__(self):
+        return self.max_length
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        g = random.Random(self.seed + self.epoch)
+        all_seq_keys = sorted(list(self.seq_to_indices.keys()))
+        g.shuffle(all_seq_keys)
+
+        my_keys = [k for i, k in enumerate(all_seq_keys) if (i % max(self.world_size, 1)) == self.rank]
+
+        indices = []
+        for k in my_keys:
+            seq_indices = list(self.seq_to_indices[k])
+            seq_indices.sort()
+            for st in range(0, len(seq_indices), max(self.batch_size, 1)):
+                chunk = seq_indices[st: st + max(self.batch_size, 1)]
+                if len(chunk) < max(self.batch_size, 1):
+                    chunk = chunk + [chunk[-1]] * (max(self.batch_size, 1) - len(chunk))
+                indices.extend(chunk)
+
+        if len(indices) == 0:
+            return iter([])
+        if len(indices) < self.max_length:
+            indices.extend([indices[-1]] * (self.max_length - len(indices)))
+        return iter(indices[:self.max_length])
 
 class MaPDatasetWrapper(Dataset):
     def __init__(self, dataset, seq_to_indices, npz_path_list=None, logger=None, no_align=False,
@@ -1337,30 +1385,24 @@ def main_worker(opts):
             no_global_ref=getattr(opts, "no_global_ref", False),
             no_local_ref=getattr(opts, "no_local_ref", False),
         )
-                # [DDP Fix] Distribute by frame-level "clips" rather than by sequences.
+        # Sequence-wise sampler (TSR-style): batch is composed within the same sequence chunk.
         rank = int(getattr(opts, "rank", 0))
         world_size = int(getattr(opts, "world_size", 1))
+        seq_batch = int(getattr(opts, "seq_batch", 0) or getattr(opts, "batch_size", 8))
 
-        if getattr(opts, "dist", False):
-            from torch.utils.data.distributed import DistributedSampler
-            train_sampler = DistributedSampler(
-                train_wrapper,
-                num_replicas=world_size,
-                rank=rank,
-                shuffle=True,
-                seed=int(getattr(opts, "seed", 42)),
-                drop_last=False,
-            )
-            shuffle = False
-        else:
-            train_sampler = None
-            shuffle = True
+        train_sampler = GroupedSequenceSampler(
+            new_train_map,
+            batch_size=seq_batch,
+            rank=rank if getattr(opts, "dist", False) else 0,
+            world_size=world_size if getattr(opts, "dist", False) else 1,
+            seed=int(getattr(opts, "seed", 42)),
+        )
 
         train_loader = DataLoader(
             train_wrapper,
-            batch_size=opts.batch_size,
-            shuffle=shuffle,
+            batch_size=seq_batch,
             sampler=train_sampler,
+            shuffle=False,
             num_workers=opts.num_workers,
             pin_memory=True,
             persistent_workers=opts.persistent_workers,
@@ -1368,6 +1410,8 @@ def main_worker(opts):
             worker_init_fn=_dataloader_worker_init,
             drop_last=False,
         )
+        if is_main:
+            logger.info(f"[SeqInput] Using sequence-grouped sampler, seq_batch={seq_batch}")
         rebuild_seq_indices(val_dataset, "Val")
 
     ## 若开启debug_line，导出可视化线框
@@ -1482,6 +1526,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_head", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4) 
     parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--seq_batch", type=int, default=None, help="Sequence-batch size for Geo_train_withSeq. If None, fallback to --batch_size")
     parser.add_argument("--train_epoch", type=int, default=40)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--AMP", action="store_true")
