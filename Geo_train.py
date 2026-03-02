@@ -1384,7 +1384,7 @@ def main_worker(opts):
             no_local_ref=getattr(opts, "no_local_ref", False),
         )
 
-    ## 若开启check_ref_frame，运行参考帧一致性检查（rgb图片），且不进入训练
+    ## 若开启check_ref_frame，运行参考帧一致性检查（模型输入线框），且不进入训练
     if getattr(opts, "check_ref_frame", False):
         if is_main:
             logger.info("[CheckRef] --check_ref_frame is enabled. Running reference-frame consistency check only.")
@@ -1509,7 +1509,7 @@ if __name__ == "__main__":
     parser.add_argument("--no_local_ref", action="store_true", help="Do not use local reference frame; replace with empty tensors")
     parser.add_argument("--debug_line", action="store_true", help="Dump local/global/current line panels for each sequence to local directory")
     parser.add_argument("--debug_line_dir", type=str, default="debug_line", help="Output directory for --debug_line panels")
-    parser.add_argument("--check_ref_frame", action="store_true", help="Run reference-frame Chamfer check and exit")
+    parser.add_argument("--check_ref_frame", action="store_true", help="Run reference-frame Chamfer check with wireframe/model-input dump and exit")
     parser.add_argument("--check_ref_frame_dir", type=str, default="check_ref_frame", help="Output directory for ref-frame check")
     parser.add_argument("--check_ref_frame_step", type=int, default=1000, help="Save one visualization every N frames")
     parser.add_argument("--check_ref_frame_random_samples", type=int, default=20, help="Additional random visualization count")
