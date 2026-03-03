@@ -643,15 +643,17 @@ def train_one_epoch_optimized(model, train_loader, dataset_obj, optimizer, devic
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast('cuda', enabled=amp, dtype=torch.bfloat16):
-            g_edge_in = None if disable_global_ref else g_edge
-            g_line_in = None if disable_global_ref else g_line
-            l_edge_in = None if disable_local_ref else l_edge
-            l_line_in = None if disable_local_ref else l_line
-            l_mask_in = None if disable_local_ref else l_mask
+            g_img_in = torch.zeros_like(c_img) if disable_global_ref else None
+            g_edge_in = torch.zeros_like(g_edge) if disable_global_ref else g_edge
+            g_line_in = torch.zeros_like(g_line) if disable_global_ref else g_line
+            l_img_in = torch.zeros_like(c_img) if disable_local_ref else None
+            l_edge_in = torch.zeros_like(l_edge) if disable_local_ref else l_edge
+            l_line_in = torch.zeros_like(l_line) if disable_local_ref else l_line
+            l_mask_in = torch.ones_like(l_mask) if disable_local_ref else l_mask
 
             ref_feat = raw_model.extract_reference_features(
-                global_img=None, global_edge=g_edge_in, global_line=g_line_in,
-                local_img=None, local_edge=l_edge_in, local_line=l_line_in, local_mask=l_mask_in,
+                global_img=g_img_in, global_edge=g_edge_in, global_line=g_line_in,
+                local_img=l_img_in, local_edge=l_edge_in, local_line=l_line_in, local_mask=l_mask_in,
             )
             
             edge_logits, line_logits = raw_model.forward_with_logits(
@@ -994,14 +996,16 @@ def evaluate_sequence(model, val_dataset, seq_to_ref, device, logger, amp, opts,
                     local_conf_t = torch.tensor([local_conf], device=device, dtype=torch.float32)
                     disable_global_ref = bool(getattr(opts, "no_global_ref", False))
                     disable_local_ref = bool(getattr(opts, "no_local_ref", False))
-                    g_edge_in = None if disable_global_ref else g_edge
-                    g_line_in = None if disable_global_ref else g_line
-                    l_edge_in = None if disable_local_ref else l_edge
-                    l_line_in = None if disable_local_ref else l_line
-                    l_mask_in = None if disable_local_ref else l_mask
+                    g_img_in = torch.zeros_like(t_img) if disable_global_ref else None
+                    g_edge_in = torch.zeros_like(g_edge) if disable_global_ref else g_edge
+                    g_line_in = torch.zeros_like(g_line) if disable_global_ref else g_line
+                    l_img_in = torch.zeros_like(t_img) if disable_local_ref else None
+                    l_edge_in = torch.zeros_like(l_edge) if disable_local_ref else l_edge
+                    l_line_in = torch.zeros_like(l_line) if disable_local_ref else l_line
+                    l_mask_in = torch.ones_like(l_mask) if disable_local_ref else l_mask
                     ref_feat = raw_model.extract_reference_features(
-                        global_img=None, global_edge=g_edge_in, global_line=g_line_in,
-                        local_img=None, local_edge=l_edge_in, local_line=l_line_in, local_mask=l_mask_in,
+                        global_img=g_img_in, global_edge=g_edge_in, global_line=g_line_in,
+                        local_img=l_img_in, local_edge=l_edge_in, local_line=l_line_in, local_mask=l_mask_in,
                     )
                     edge_logits, line_logits = raw_model.forward_with_logits(
                         img_idx=t_img, edge_idx=t_edge_gt, line_idx=t_line_gt, masks=t_mask, ref_feat=ref_feat
