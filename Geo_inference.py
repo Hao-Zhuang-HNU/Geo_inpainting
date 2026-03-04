@@ -39,9 +39,9 @@ def dilate_tensor(x, kernel_size=3):
 
 
 def prepare_gt_line_input(gt_line, mask, dilate_line=1):
-    """Prepare known-region GT line input with optional dilation for train/infer consistency."""
-    gt_line_in = dilate_tensor(gt_line, dilate_line) if dilate_line > 1 else gt_line
-    return gt_line_in * (1 - mask)
+    """Prepare known-region GT line input (line dilation is applied at pkl-loading stage)."""
+    _ = dilate_line
+    return gt_line * (1 - mask)
 
 
 def warp_tensor_from_npz(prev_tensor, npz_path, size=256, device='cuda'):
@@ -67,6 +67,29 @@ def warp_tensor_from_npz(prev_tensor, npz_path, size=256, device='cuda'):
         print(f"[Warp Error] {e} for {npz_path}")
         return default_res
 
+
+
+def patch_dataset_line_loader_with_dilation(dataset, dilate_line):
+    """Dilate line map right after loading from pkl in dataset.load_wireframe."""
+    if dilate_line <= 1:
+        return
+
+    raw_load_wireframe = dataset.load_wireframe
+
+    def _load_wireframe_with_dilate(selected_basename, size):
+        line = raw_load_wireframe(selected_basename, size)
+        line = np.asarray(line, dtype=np.float32)
+        if line.ndim == 3:
+            line = line[..., 0]
+        line = np.clip(line, 0.0, 1.0)
+
+        k = np.ones((dilate_line, dilate_line), dtype=np.uint8)
+        line_u8 = (line * 255.0).astype(np.uint8)
+        line_u8 = cv2.dilate(line_u8, k, iterations=1)
+        line = line_u8.astype(np.float32) / 255.0
+        return np.clip(line, 0.0, 1.0).astype(np.float32)
+
+    dataset.load_wireframe = _load_wireframe_with_dilate
 
 def build_model(opts):
     cfg = EdgeLineGPTConfig(
@@ -123,8 +146,9 @@ def geo_inference(opts):
         image_size=opts.image_size,
         line_path=opts.test_line_list,
     )
+    patch_dataset_line_loader_with_dilation(dataset, opts.dilate_line)
 
-    print(f'Inference frames: {len(dataset)}')
+    print(f'Inference frames: {len(dataset)} (dilate_line={opts.dilate_line})')
 
     # ---- Frame 0: use GT as initialization and produce first generated frame ----
     first = dataset[0]
