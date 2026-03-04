@@ -38,6 +38,12 @@ def dilate_tensor(x, kernel_size=3):
     return F.max_pool2d(x, kernel_size=kernel_size, stride=1, padding=padding)
 
 
+def prepare_gt_line_input(gt_line, mask, dilate_line=1):
+    """Prepare known-region GT line input with optional dilation for train/infer consistency."""
+    gt_line_in = dilate_tensor(gt_line, dilate_line) if dilate_line > 1 else gt_line
+    return gt_line_in * (1 - mask)
+
+
 def warp_tensor_from_npz(prev_tensor, npz_path, size=256, device='cuda'):
     if prev_tensor is None:
         return None
@@ -134,7 +140,7 @@ def geo_inference(opts):
     with torch.no_grad():
         edge0, line0, _ = SampleEdgeLineLogitsWithRefExtraction(
             model,
-            context=[img0, gt_e0 * (1 - mask0), gt_l0 * (1 - mask0)],
+            context=[img0, gt_e0 * (1 - mask0), prepare_gt_line_input(gt_l0, mask0, opts.dilate_line)],
             mask=mask0,
             iterations=opts.iterations,
             extract_ref=False,
@@ -184,7 +190,7 @@ def geo_inference(opts):
 
             edge_pred, line_pred, _ = SampleEdgeLineLogitsWithRefExtraction(
                 model,
-                context=[img, gt_e * (1 - mask), gt_l * (1 - mask)],
+                context=[img, gt_e * (1 - mask), prepare_gt_line_input(gt_l, mask, opts.dilate_line)],
                 mask=mask,
                 iterations=opts.iterations,
                 ref_feat=ref_feat,
@@ -212,6 +218,8 @@ if __name__ == '__main__':
     parser.add_argument('--save_url', type=str, default='./results_geo')
     parser.add_argument('--iterations', type=int, default=5)
     parser.add_argument('--ref_dilate', type=int, default=3)
+    parser.add_argument('--dilate_line', type=int, default=1, choices=[1, 3],
+                        help='Optional GT line dilation size to match training strategy.')
 
     args = parser.parse_args()
     os.environ['CUDA_VISIBLE_DEVICES'] = args.GPU_ids
