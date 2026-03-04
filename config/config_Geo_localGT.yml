@@ -2,7 +2,7 @@
 # 全局训练配置 (Global Training Settings)
 # ===============================================================
 model_settings:
-  name: "Geo_localGT"
+  name: "Geo_localGT_FULL"
   # pretrain_ckpt: "ckpt/best_transformer_places2.pth"
   tb_images: True
   tb_max_images: 5
@@ -11,7 +11,7 @@ model_settings:
 training_params:
   lr: 1e-4
   train_epoch: 50
-  seq_batch: 100
+  seq_batch: 110
   num_workers: 6
   prefetch_factor: 2
   AMP: True
@@ -33,9 +33,9 @@ dataset1:
   enable: True
   name: "DL3DV"
   ratio: 1
-  train_imgs_list: "filter_results/filter_DL3DV2K_40/train_imgs_clean.txt"
-  train_pkls_list: "filter_results/filter_DL3DV2K_40/train_pkls_clean.txt"
-  train_npzs_list: "filter_results/filter_DL3DV2K_40/train_npzs_clean.txt"
+  train_imgs_list: "filter_results/filter_DL3DV10K_40/train_imgs_clean.txt"
+  train_pkls_list: "filter_results/filter_DL3DV10K_40/train_pkls_clean.txt"
+  train_npzs_list: "filter_results/filter_DL3DV10K_40/train_npzs_clean.txt"
 
   val_imgs_list: "filter_results/filter_DL3DV_val/train_imgs_clean.txt"
   val_pkls_list: "filter_results/filter_DL3DV_val/train_pkls_clean.txt"
@@ -45,12 +45,12 @@ dataset1:
 # 数据集 2: ScannetPP
 # ===============================================================
 dataset2:
-  enable: False
+  enable: True
   name: "ScannetPP"
   ratio: 1
-  train_imgs_list: ""
-  train_pkls_list: ""
-  train_npzs_list: ""
+  train_imgs_list: "filter_results/filter_ScannetPP_40/train_imgs_clean.txt"
+  train_pkls_list: "filter_results/filter_ScannetPP_40/train_pkls_clean.txt"
+  train_npzs_list: "filter_results/filter_ScannetPP_40/train_npzs_clean.txt"
 
   val_imgs_list: ""
   val_pkls_list: ""
