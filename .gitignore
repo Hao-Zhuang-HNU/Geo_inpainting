@@ -4,6 +4,7 @@ eval_out/
 results/
 tb_logs/
 test_list/
+DL3DV_testlist/
 data_list/
 1e1a_flow_test/
 debug_test/
