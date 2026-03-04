@@ -643,10 +643,12 @@ def train_one_epoch_optimized(model, train_loader, dataset_obj, optimizer, devic
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast('cuda', enabled=amp, dtype=torch.bfloat16):
-            g_img_in = torch.zeros_like(c_img) if disable_global_ref else None
+            # Use same-resolution blank images instead of None for reference-image inputs.
+            # This keeps tensor-shaped inputs stable in ablation/non-ablation modes.
+            g_img_in = torch.zeros_like(c_img)
             g_edge_in = torch.zeros_like(g_edge) if disable_global_ref else g_edge
             g_line_in = torch.zeros_like(g_line) if disable_global_ref else g_line
-            l_img_in = torch.zeros_like(c_img) if disable_local_ref else None
+            l_img_in = torch.zeros_like(c_img)
             l_edge_in = torch.zeros_like(l_edge) if disable_local_ref else l_edge
             l_line_in = torch.zeros_like(l_line) if disable_local_ref else l_line
             l_mask_in = torch.ones_like(l_mask) if disable_local_ref else l_mask
@@ -996,10 +998,11 @@ def evaluate_sequence(model, val_dataset, seq_to_ref, device, logger, amp, opts,
                     local_conf_t = torch.tensor([local_conf], device=device, dtype=torch.float32)
                     disable_global_ref = bool(getattr(opts, "no_global_ref", False))
                     disable_local_ref = bool(getattr(opts, "no_local_ref", False))
-                    g_img_in = torch.zeros_like(t_img) if disable_global_ref else None
+                    # Use same-resolution blank images instead of None for reference-image inputs.
+                    g_img_in = torch.zeros_like(t_img)
                     g_edge_in = torch.zeros_like(g_edge) if disable_global_ref else g_edge
                     g_line_in = torch.zeros_like(g_line) if disable_global_ref else g_line
-                    l_img_in = torch.zeros_like(t_img) if disable_local_ref else None
+                    l_img_in = torch.zeros_like(t_img)
                     l_edge_in = torch.zeros_like(l_edge) if disable_local_ref else l_edge
                     l_line_in = torch.zeros_like(l_line) if disable_local_ref else l_line
                     l_mask_in = torch.ones_like(l_mask) if disable_local_ref else l_mask
@@ -1405,8 +1408,17 @@ def main_worker(opts):
 
     model = build_model(opts, device, logger)
     if opts.dist:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-        if is_main: logger.info("[DDP] Model wrapped with DistributedDataParallel")
+        # Ablation modes may change active reference branches; enable unused-param detection
+        # to avoid potential DDP hangs when a branch becomes conditionally inactive.
+        ddp_find_unused = bool(getattr(opts, "no_global_ref", False) or getattr(opts, "no_local_ref", False))
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=ddp_find_unused,
+        )
+        if is_main:
+            logger.info(f"[DDP] Model wrapped with DistributedDataParallel (find_unused_parameters={ddp_find_unused})")
     
     optim_kwargs = {'lr': opts.lr, 'betas': (0.9, 0.95), 'weight_decay': 0.0}
     if torch.cuda.is_available() and hasattr(torch.optim, 'Adam') and 'fused' in torch.optim.Adam.__init__.__code__.co_varnames: optim_kwargs['fused'] = True
