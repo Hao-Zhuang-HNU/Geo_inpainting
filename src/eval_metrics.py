@@ -4,10 +4,9 @@ import cv2
 import torch
 import struct
 from scipy.ndimage import distance_transform_edt
-from sklearn.metrics import average_precision_score
 
 # =========================================================
-# Part 1: 基础几何指标 (F1, Chamfer, AP)
+# Part 1: 基础几何指标 (Precision, Recall, F1, Chamfer)
 # =========================================================
 
 def _to_binary(data, threshold=0.5):
@@ -16,38 +15,7 @@ def _to_binary(data, threshold=0.5):
         data = data.detach().cpu().numpy()
     return data > threshold
 
-def compute_pixel_ap(pred, gt, mask=None):
-    """
-    计算像素级 Average Precision (AP)
-    pred: [H, W] range 0-1 (预测概率)
-    gt: [H, W] range 0 or 1 (真实标签)
-    mask: [H, W] range 0 or 1 (可选)
-    """
-    # 1. 展平
-    pred_flat = pred.flatten()
-    gt_flat = gt.flatten()
-    
-    # 2. 处理 Mask
-    if mask is not None:
-        mask_flat = mask.flatten().astype(bool)
-        pred_flat = pred_flat[mask_flat]
-        gt_flat = gt_flat[mask_flat]
-        
-    # 3. 边界检查
-    if len(gt_flat) == 0:
-        return 0.0
-        
-    # === 关键修复: 强制 GT 二值化 ===
-    # sklearn 要求 y_true 为 {0, 1} 或 {-1, 1}
-    # 即使 GT 只有 0.0 和 1.0，如果是 float 类型有时候也会报错，最好转 int
-    gt_flat = (gt_flat > 0.5).astype(int) 
-    
-    if gt_flat.sum() == 0:
-        return 0.0 # 如果没有正样本，AP 无定义或为 0
-        
-    return average_precision_score(gt_flat, pred_flat)
-
-def compute_structural_f1(pred, gt, mask=None, threshold=0.5, tolerance=2.0):
+def compute_structural_prf1(pred, gt, mask=None, threshold=0.5, tolerance=2.0):
     """
     计算带容差的 F1-Score
     """
@@ -60,9 +28,9 @@ def compute_structural_f1(pred, gt, mask=None, threshold=0.5, tolerance=2.0):
         gt_bin = gt_bin & mask_bin
 
     if not np.any(pred_bin) and not np.any(gt_bin):
-        return 1.0
+        return 1.0, 1.0, 1.0
     if not np.any(pred_bin) or not np.any(gt_bin):
-        return 0.0
+        return 0.0, 0.0, 0.0
 
     # Distance Transform
     # dt_gt: distance from every pixel to nearest GT pixel
@@ -79,6 +47,12 @@ def compute_structural_f1(pred, gt, mask=None, threshold=0.5, tolerance=2.0):
     recall = tp_gt / (np.sum(gt_bin) + 1e-6)
     
     f1 = 2 * precision * recall / (precision + recall + 1e-6)
+    return precision, recall, f1
+
+
+def compute_structural_f1(pred, gt, mask=None, threshold=0.5, tolerance=2.0):
+    """兼容旧接口，仅返回 F1。"""
+    _, _, f1 = compute_structural_prf1(pred, gt, mask, threshold, tolerance)
     return f1
 
 def compute_chamfer_distance(pred, gt, mask=None, threshold=0.5):
@@ -360,23 +334,14 @@ def compute_all_metrics(pred, gt, mask=None, threshold=0.5,
     """
     metrics = {}
     
-    # 1. Basic Metrics
-    metrics['f1'] = compute_structural_f1(pred, gt, mask, threshold)
-    metrics['ap'] = compute_pixel_ap(pred, gt, mask)
-    metrics['chamfer'] = compute_chamfer_distance(pred, gt, mask, threshold)
-    
-    # 2. Reprojection Consistency (Optional)
-    if use_reproj and _colmap_evaluator is not None and cur_name and ref_name and depth_dir:
-        # 构造深度图路径: frame_00001.png.geometric.bin
-        # 假设 colmap depth 命名规则是 图像名 + .geometric.bin
-        depth_name = ref_name + ".geometric.bin"
-        depth_path = os.path.join(depth_dir, depth_name)
-        
-        reproj_score = _colmap_evaluator.compute_reprojection_consistency(
-            pred, gt, cur_name, ref_name, depth_path, mask
-        )
-        if reproj_score >= 0:
-            metrics['reproj_consist'] = reproj_score
+    # 1. Basic Metrics (for masked-line inpainting ablation)
+    precision, recall, f1 = compute_structural_prf1(pred, gt, mask, threshold)
+    metrics['precision'] = precision
+    metrics['recall'] = recall
+    metrics['f1'] = f1
+
+    # Chamfer Distance(all): evaluate over full image, not limited to mask
+    metrics['chamfer_all'] = compute_chamfer_distance(pred, gt, mask=None, threshold=threshold)
             
     return metrics
 
