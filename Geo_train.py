@@ -11,7 +11,7 @@ import yaml
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Sampler, Dataset
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -389,12 +389,26 @@ class MaPDatasetWrapper(Dataset):
                 except Exception:
                     pass
 
-        if not valid_local:
+        # Keep a small reference-dropout ratio to avoid over-reliance on local reference
+        # and reduce train/infer exposure bias.
+        if (not valid_local) or (self.dataset.is_train and random.random() < 0.2):
             l_edge_t = torch.zeros_like(curr_item['edge'])
             l_line_t = torch.zeros_like(curr_item['line'])
             l_mask_t = torch.ones_like(curr_item['mask'])
             if l_mask_t.dim() == 2:
                 l_mask_t = l_mask_t.unsqueeze(0)
+
+        # Simulate mild local-reference noise during training to improve robustness.
+        if self.dataset.is_train and valid_local:
+            if random.random() < 0.5:
+                if random.random() < 0.6:
+                    sigma = random.uniform(0.5, 1.0)
+                    l_edge_t = T.GaussianBlur(kernel_size=5, sigma=sigma)(l_edge_t)
+                    l_line_t = T.GaussianBlur(kernel_size=5, sigma=sigma)(l_line_t)
+                else:
+                    scale = random.uniform(0.6, 0.9)
+                    l_edge_t = l_edge_t * scale
+                    l_line_t = l_line_t * scale
 
         seq_hash = hash(str(info['seq_id']))
 
@@ -421,6 +435,57 @@ class MaPDatasetWrapper(Dataset):
         }
                 
 
+# Sampler with padding to keep per-rank steps consistent in DDP
+class GroupedSequenceSampler(Sampler):
+    def __init__(self, seq_to_indices, batch_size, rank=0, world_size=1, seed=42):
+        self.seq_to_indices = seq_to_indices
+        self.batch_size = batch_size
+        self.rank = rank
+        self.world_size = world_size
+        self.epoch = 0
+        self.seed = seed
+
+        all_seq_keys = sorted(list(seq_to_indices.keys()))
+
+        self.rank_lengths = collections.defaultdict(int)
+        for i, k in enumerate(all_seq_keys):
+            r = i % world_size
+            self.rank_lengths[r] += len(seq_to_indices[k])
+
+        self.max_length = 0
+        if self.rank_lengths:
+            self.max_length = max(self.rank_lengths.values())
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __iter__(self):
+        g = random.Random(self.seed + self.epoch)
+        all_seq_keys = sorted(list(self.seq_to_indices.keys()))
+        g.shuffle(all_seq_keys)
+
+        local_keys = [k for i, k in enumerate(all_seq_keys) if (i % self.world_size) == self.rank]
+
+        final_indices = []
+        for key in local_keys:
+            seq_idxs = self.seq_to_indices[key]
+            final_indices.extend(seq_idxs)
+
+        current_len = len(final_indices)
+        if current_len < self.max_length and current_len > 0:
+            while len(final_indices) < self.max_length:
+                needed = self.max_length - len(final_indices)
+                subset = final_indices[:needed]
+                if not subset:
+                    break
+                final_indices.extend(subset)
+
+        return iter(final_indices)
+
+    def __len__(self):
+        return self.max_length
+
+
 def build_datasets_and_loader(opts, logger, train_npz_list=None):
     if not opts.MaP: raise ValueError("Only MaP mode is supported.")
     base_dataset = ContinuousEdgeLineDatasetMaskFinetune(
@@ -441,29 +506,17 @@ def build_datasets_and_loader(opts, logger, train_npz_list=None):
     
     rank = int(getattr(opts, "rank", 0))
     world_size = int(getattr(opts, "world_size", 1))
-
-    # [DDP Fix] Distribute by frame-level "clips" (global ref, local ref, frame i)
-    # instead of distributing by sequence lengths. This avoids rank imbalance and DDP timeout
-    # caused by highly variable sequence lengths.
-    if getattr(opts, "dist", False):
-        from torch.utils.data.distributed import DistributedSampler
-        train_sampler = DistributedSampler(
-            train_wrapper,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True,
-            seed=int(getattr(opts, "seed", 42)),
-            drop_last=False,
-        )
-        shuffle = False
-    else:
-        train_sampler = None
-        shuffle = True
+    train_sampler = GroupedSequenceSampler(
+        base_dataset.seq_to_indices,
+        opts.batch_size,
+        rank=rank,
+        world_size=world_size,
+        seed=opts.seed,
+    )
 
     train_loader = DataLoader(
         train_wrapper,
         batch_size=opts.batch_size,
-        shuffle=shuffle,
         sampler=train_sampler,
         num_workers=opts.num_workers,
         pin_memory=True,
@@ -640,6 +693,12 @@ def train_one_epoch_optimized(model, train_loader, dataset_obj, optimizer, devic
         for t in [c_mask, c_edge, c_line, l_mask, l_edge, l_line, g_edge, g_line]:
             if t.dim() == 3: t.unsqueeze_(1)
 
+        if getattr(opts, "ref_dilate", 1) > 1:
+            g_edge = dilate_tensor(g_edge, opts.ref_dilate)
+            g_line = dilate_tensor(g_line, opts.ref_dilate)
+            l_edge = dilate_tensor(l_edge, opts.ref_dilate)
+            l_line = dilate_tensor(l_line, opts.ref_dilate)
+
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast('cuda', enabled=amp, dtype=torch.bfloat16):
@@ -672,6 +731,11 @@ def train_one_epoch_optimized(model, train_loader, dataset_obj, optimizer, devic
             else:
                 loss_edge = criterion(edge_logits, target_edge)
                 loss = (loss_edge + loss_line)
+
+            # Keep confidence-aware sample weighting from the original training script.
+            if local_conf is not None:
+                loss_weight = 1.0 + local_conf.mean().item()
+                loss = loss * loss_weight
         
         if torch.isnan(loss) or torch.isinf(loss):
             # 将 loss 抹零，使其产生 全0梯度，参与 DDP 同步
@@ -690,7 +754,7 @@ def train_one_epoch_optimized(model, train_loader, dataset_obj, optimizer, devic
             if should_log:
                 try:
                     curr_orig_idx = batch['orig_idx'][0].item()
-                    seq_id_val = train_wrapper.idx_to_seq.get(curr_orig_idx, "unknown")
+                    seq_id_val = train_loader.dataset.idx_to_seq.get(curr_orig_idx, "unknown")
                     seq_name = str(seq_id_val)[:10]
                 except:
                     seq_name = "unknown"
@@ -1086,6 +1150,19 @@ def evaluate_sequence(model, val_dataset, seq_to_ref, device, logger, amp, opts,
 
 
 # 【新增】解析 Config 覆盖 Opts 的函数
+def _as_bool(v):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        vv = v.strip().lower()
+        if vv in {"1", "true", "yes", "y", "on"}:
+            return True
+        if vv in {"0", "false", "no", "n", "off", ""}:
+            return False
+    return bool(v)
+
 def load_config_to_opts(opts):
     if not opts.config_path or not os.path.exists(opts.config_path):
         return opts
@@ -1098,7 +1175,7 @@ def load_config_to_opts(opts):
     if 'name' in ms: opts.name = str(ms['name'])
     if 'pretrain_ckpt' in ms: opts.pretrain_ckpt = str(ms['pretrain_ckpt'])
     if 'tb_logdir' in ms: opts.tb_logdir = str(ms['tb_logdir'])
-    if 'tb_images' in ms: opts.tb_images = bool(ms['tb_images'])
+    if 'tb_images' in ms: opts.tb_images = _as_bool(ms['tb_images'])
     if 'tb_max_images' in ms: opts.tb_max_images = int(ms['tb_max_images'])
 
     # Training Params
@@ -1115,16 +1192,16 @@ def load_config_to_opts(opts):
         opts.batch_size = int(tp['seq_batch'])
     if 'num_workers' in tp: opts.num_workers = int(tp['num_workers'])
     if 'prefetch_factor' in tp: opts.prefetch_factor = int(tp['prefetch_factor'])
-    if 'persistent_workers' in tp: opts.persistent_workers = bool(tp['persistent_workers'])
-    if 'AMP' in tp: opts.AMP = bool(tp['AMP'])
-    if 'MaP' in tp: opts.MaP = bool(tp['MaP'])
+    if 'persistent_workers' in tp: opts.persistent_workers = _as_bool(tp['persistent_workers'])
+    if 'AMP' in tp: opts.AMP = _as_bool(tp['AMP'])
+    if 'MaP' in tp: opts.MaP = _as_bool(tp['MaP'])
     
     if 'focal_weight' in tp: opts.focal_weight = float(tp['focal_weight'])
     if 'tversky_weight' in tp: opts.tversky_weight = float(tp['tversky_weight'])
     if 'line_tv_alpha' in tp: opts.line_tv_alpha = float(tp['line_tv_alpha'])
     if 'line_tv_beta' in tp: opts.line_tv_beta = float(tp['line_tv_beta'])
     if 'dilate1_ep' in tp: opts.dilate1_ep = int(tp['dilate1_ep'])
-    if 'disable_edge' in tp: opts.disable_edge = bool(tp['disable_edge'])
+    if 'disable_edge' in tp: opts.disable_edge = _as_bool(tp['disable_edge'])
 
     # Masks
     mk = cfg.get('masks', {})
@@ -1132,10 +1209,10 @@ def load_config_to_opts(opts):
     if 'val_mask_list' in mk: opts.valid_mask_path = str(mk['val_mask_list'])
 
     # 消融指标
-    if 'no_align' in tp: opts.no_align = bool(tp['no_align'])
-    if 'no_global_ref' in tp: opts.no_global_ref = bool(tp['no_global_ref'])
-    if 'no_local_ref' in tp: opts.no_local_ref = bool(tp['no_local_ref'])
-    if 'debug_line' in tp: opts.debug_line = bool(tp['debug_line'])
+    if 'no_align' in tp: opts.no_align = _as_bool(tp['no_align'])
+    if 'no_global_ref' in tp: opts.no_global_ref = _as_bool(tp['no_global_ref'])
+    if 'no_local_ref' in tp: opts.no_local_ref = _as_bool(tp['no_local_ref'])
+    if 'debug_line' in tp: opts.debug_line = _as_bool(tp['debug_line'])
     if 'debug_line_dir' in tp: opts.debug_line_dir = str(tp['debug_line_dir'])
 
     
@@ -1344,29 +1421,19 @@ def main_worker(opts):
             no_global_ref=getattr(opts, "no_global_ref", False),
             no_local_ref=getattr(opts, "no_local_ref", False),
         )
-                # [DDP Fix] Distribute by frame-level "clips" rather than by sequences.
         rank = int(getattr(opts, "rank", 0))
         world_size = int(getattr(opts, "world_size", 1))
-
-        if getattr(opts, "dist", False):
-            from torch.utils.data.distributed import DistributedSampler
-            train_sampler = DistributedSampler(
-                train_wrapper,
-                num_replicas=world_size,
-                rank=rank,
-                shuffle=True,
-                seed=int(getattr(opts, "seed", 42)),
-                drop_last=False,
-            )
-            shuffle = False
-        else:
-            train_sampler = None
-            shuffle = True
+        train_sampler = GroupedSequenceSampler(
+            new_train_map,
+            opts.batch_size,
+            rank=rank,
+            world_size=world_size,
+            seed=opts.seed,
+        )
 
         train_loader = DataLoader(
             train_wrapper,
             batch_size=opts.batch_size,
-            shuffle=shuffle,
             sampler=train_sampler,
             num_workers=opts.num_workers,
             pin_memory=True,
