@@ -15,8 +15,8 @@ def parse_args():
     parser.add_argument('-o', '--output_dir', type=str, required=True, help='Directory to save new lists and reject logs')
     
     # 阈值设置
-    parser.add_argument('--iou_th', type=float, default=0.25, help='Threshold for Sequence Mean IoU')
-    parser.add_argument('--line_th', type=float, default=25.0, help='Threshold for Sequence Mean Line Count')
+    parser.add_argument('--iou_th', type=float, default=0.40, help='Threshold for Sequence Mean IoU')
+    parser.add_argument('--line_th', type=float, default=40.0, help='Threshold for Sequence Mean Line Count')
     
     # 【新增】黑名单参数
     parser.add_argument('--rm_list', type=str, default=None, help='Path to a blacklist txt (optional). Sequences in this list will be removed.')
