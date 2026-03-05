@@ -18,6 +18,81 @@ except ImportError:
 import warnings
 warnings.filterwarnings("ignore")
 
+
+def raster_mask(lines_xyxy, w, h, scale=0.25):
+    sh = max(1, int(round(h * scale)))
+    sw = max(1, int(round(w * scale)))
+    canvas = np.zeros((sh, sw), dtype=np.uint8)
+    if lines_xyxy.size == 0:
+        return canvas
+    lines_scaled = (lines_xyxy * scale).astype(np.float32)
+    for l in lines_scaled:
+        cv2.line(canvas, (int(l[0]), int(l[1])), (int(l[2]), int(l[3])), 1, 1)
+    return canvas
+
+
+def mask_iou(mask_a, mask_b):
+    inter = np.logical_and(mask_a, mask_b).sum()
+    union = np.logical_or(mask_a, mask_b).sum()
+    return float(inter) / float(union) if union > 0 else 0.0
+
+
+def mask_precision_recall(mask_warp, mask_curr):
+    inter = int(np.logical_and(mask_warp, mask_curr).sum())
+    a = int(mask_warp.sum())
+    b = int(mask_curr.sum())
+    precision = float(inter) / float(a) if a > 0 else 0.0
+    recall = float(inter) / float(b) if b > 0 else 0.0
+    return precision, recall
+
+
+def _sigmoid(x):
+    return float(1.0 / (1.0 + np.exp(-float(x))))
+
+
+def _distance_transform_to_lines(lines_xyxy, w, h):
+    if lines_xyxy.size == 0:
+        return np.full((h, w), 1e6, dtype=np.float32)
+    img = np.full((h, w), 255, dtype=np.uint8)
+    for l in lines_xyxy.astype(np.float32):
+        x1 = int(np.clip(round(float(l[0])), 0, w - 1))
+        y1 = int(np.clip(round(float(l[1])), 0, h - 1))
+        x2 = int(np.clip(round(float(l[2])), 0, w - 1))
+        y2 = int(np.clip(round(float(l[3])), 0, h - 1))
+        cv2.line(img, (x1, y1), (x2, y2), 0, 1)
+    dt = cv2.distanceTransform(img, cv2.DIST_L2, 3)
+    return dt.astype(np.float32, copy=False)
+
+
+def _mean_dt_at_endpoints(lines_xyxy, dt_hw):
+    if lines_xyxy.size == 0:
+        return 1e6
+    h, w = dt_hw.shape[:2]
+    pts = lines_xyxy.reshape(-1, 2).astype(np.float32)
+    xs = np.clip(np.round(pts[:, 0]).astype(np.int32), 0, w - 1)
+    ys = np.clip(np.round(pts[:, 1]).astype(np.int32), 0, h - 1)
+    vals = dt_hw[ys, xs]
+    return float(vals.mean()) if vals.size > 0 else 1e6
+
+
+def endpoint_sym_error(prev_warp_xyxy, curr_lines_xyxy, w, h):
+    if (prev_warp_xyxy.size == 0) or (curr_lines_xyxy.size == 0):
+        return 1e6
+    dt_curr = _distance_transform_to_lines(curr_lines_xyxy, w, h)
+    dt_prev = _distance_transform_to_lines(prev_warp_xyxy, w, h)
+    e_prev2curr = _mean_dt_at_endpoints(prev_warp_xyxy, dt_curr)
+    e_curr2prev = _mean_dt_at_endpoints(curr_lines_xyxy, dt_prev)
+    return 0.5 * (float(e_prev2curr) + float(e_curr2prev))
+
+
+def composite_score_scheme_a(precision, recall, endpoint_err, p0=0.5, slope=0.1, tau=2.5):
+    p = float(np.clip(precision, 0.0, 1.0))
+    r = float(np.clip(recall, 0.0, 1.0))
+    e = max(0.0, float(endpoint_err))
+    sp = _sigmoid((p - p0) / slope)
+    sr = _sigmoid((r - p0) / slope)
+    return float(sp * sr * np.exp(-e / tau))
+
 # ================= Global for Workers =================
 model_disk = None
 model_lightglue = None
@@ -120,6 +195,7 @@ def warp_lines_local_idw(lines, mkpts0, mkpts1, k=10, dist_thresh=None):
 
 def process_pair(args):
     path_curr, pkl_curr, path_prev, pkl_prev, save_path, is_first = args
+    iou_thr = 0.05
     
     # 如果已存在，跳过 (断点续传)
     if os.path.exists(save_path): return
@@ -135,6 +211,10 @@ def process_pair(args):
             mkpts1=np.zeros((0, 2), dtype=np.float32),
             confidence_match=0.0, 
             confidence_iou=0.0, 
+            iou_raw=0.0,
+            pr_precision=0.0,
+            pr_recall=0.0,
+            endpoint_err=1e6,
             valid=False
         )
         return
@@ -145,7 +225,19 @@ def process_pair(args):
     
     if img_curr_bgr is None or img_prev_bgr is None:
         # 读取失败，写入空数据防止报错
-        np.savez_compressed(save_path, homography=np.eye(3), valid=False)
+        np.savez_compressed(
+            save_path,
+            homography=np.eye(3, dtype=np.float32),
+            mkpts0=np.zeros((0, 2), dtype=np.float32),
+            mkpts1=np.zeros((0, 2), dtype=np.float32),
+            confidence_match=0.0,
+            confidence_iou=0.0,
+            iou_raw=0.0,
+            pr_precision=0.0,
+            pr_recall=0.0,
+            endpoint_err=1e6,
+            valid=False,
+        )
         return
 
     h, w = img_curr_bgr.shape[:2]
@@ -212,40 +304,27 @@ def process_pair(args):
     except Exception as e:
         print(f"Inference error {path_curr}: {e}")
 
-    # 6. 计算 IoU (使用 IDW 局部 Warp)
-    iou_score = 0.0
-    if num_matches > 10: # IDW 需要一定数量的匹配点才稳定
+    # 6. 计算 Chamfer/重叠复合分数（与 preprocess_raft_large_score.py 一致）
+    score = 0.0
+    iou_raw = 0.0
+    pr_p = 0.0
+    pr_r = 0.0
+    endpoint_err = 1e6
+    if num_matches > 10:
         lines_prev = get_hawp_lines_proven(pkl_prev, w, h)
         lines_curr = get_hawp_lines_proven(pkl_curr, w, h)
         
         if len(lines_prev) > 0 and len(lines_curr) > 0:
-            # === 核心修改：使用 IDW 替代 PerspectiveTransform ===
-            # 将上一帧的线根据光流场 warp 到当前帧
             lines_warped = warp_lines_local_idw(lines_prev, mkpts0, mkpts1, k=10)
-            
-            # 使用栅格化 (Rasterization) 方法快速计算 IoU
-            # 缩小画布尺寸以加快计算速度 (精度足够用于过滤)
-            scale = 0.25 # 缩放到原图的 1/4
-            sh, sw = int(h*scale), int(w*scale)
-            
-            c_warp = np.zeros((sh, sw), dtype=np.uint8)
-            c_curr = np.zeros((sh, sw), dtype=np.uint8)
-            
-            # 绘制线条 (thickness=1)
-            # 注意坐标需要缩放
-            for l in lines_warped * scale:
-                cv2.line(c_warp, (int(l[0]), int(l[1])), (int(l[2]), int(l[3])), 1, 1)
-            
-            for l in lines_curr * scale:
-                cv2.line(c_curr, (int(l[0]), int(l[1])), (int(l[2]), int(l[3])), 1, 1)
-                
-            # 计算 IoU
-            inter = np.logical_and(c_warp, c_curr).sum()
-            union = np.logical_or(c_warp, c_curr).sum()
-            iou_score = inter / union if union > 0 else 0.0
+            prev_mask = raster_mask(lines_warped, w, h, scale=0.25)
+            curr_mask = raster_mask(lines_curr, w, h, scale=0.25)
+            iou_raw = mask_iou(prev_mask, curr_mask)
+            pr_p, pr_r = mask_precision_recall(prev_mask, curr_mask)
+            endpoint_err = endpoint_sym_error(lines_warped, lines_curr, w, h)
+            score = composite_score_scheme_a(pr_p, pr_r, endpoint_err)
 
     # 7. 保存结果
-    is_valid = (match_score > 0.05) # 稍微放宽阈值，因为 LightGlue 很准
+    is_valid = (score > iou_thr)
     
     np.savez_compressed(
         save_path,
@@ -253,7 +332,11 @@ def process_pair(args):
         mkpts0=mkpts0,          # 源匹配点 (新特性，允许后续复现 IDW)
         mkpts1=mkpts1,          # 目标匹配点
         confidence_match=float(match_score),
-        confidence_iou=float(iou_score), # 基于 IDW 的 IoU
+        confidence_iou=float(score),
+        iou_raw=float(iou_raw),
+        pr_precision=float(pr_p),
+        pr_recall=float(pr_r),
+        endpoint_err=float(endpoint_err),
         valid=is_valid
     )
 
