@@ -2,8 +2,8 @@
 # 全局训练配置 (Global Training Settings)
 # ===============================================================
 model_settings:
-  name: "Geo_localGT_noG"
-  # pretrain_ckpt: "ckpt/best_transformer_places2.pth"
+  name: "Geo_localLastFrame"
+  pretrain_ckpt: "ckpt/best_transformer_places2.pth"
   tb_images: True
   tb_max_images: 5
   tb_logdir: "/root/tf-logs/"
@@ -23,7 +23,7 @@ training_params:
   dilate1_ep: 30
   disable_edge: True
   accumulation_steps: 2  # 梯度累积补偿小 batch
-  no_align: True
+  # no_align: True
   # debug_line: True
 
 # ===============================================================
