@@ -6,6 +6,7 @@ from tqdm import tqdm
 from multiprocessing import Pool
 import collections
 import sys
+import re
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Advanced Dataset Filtering with Blacklist")
@@ -26,22 +27,31 @@ def parse_args():
 
 def get_seq_id(path):
     """
-    遍历路径分割后的每一部分，返回第一个长度超过20个字符的文件夹名作为序列ID。
+    从左到右查找目录名，命中 ._imgs/._pkls/._npzs/._flow（. 代表任意一个字符）后，
+    继续在其下级目录中查找，返回第一个长度 > 5 的目录名作为序列ID。
     """
     parts = path.split(os.sep)
-    for part in parts:
-        if len(part) > 20:
-            return part
+    marker_pattern = re.compile(r'^._(imgs|pkls|npzs|flow)$')
+    for i, part in enumerate(parts):
+        if marker_pattern.match(part):
+            for child in parts[i + 1:]:
+                if len(child) > 5:
+                    return child
+            break
     return os.path.basename(os.path.dirname(path))
 
 def get_seq_path(path):
     """
-    获取序列的根目录路径（包含那个长哈希名的那一层），用于路径匹配
+    获取序列根目录路径（包含 marker 后第一个长度 > 5 的目录层），用于路径匹配。
     """
     parts = path.split(os.sep)
+    marker_pattern = re.compile(r'^._(imgs|pkls|npzs|flow)$')
     for i, part in enumerate(parts):
-        if len(part) > 20:
-            return os.sep.join(parts[:i+1])
+        if marker_pattern.match(part):
+            for j in range(i + 1, len(parts)):
+                if len(parts[j]) > 5:
+                    return os.sep.join(parts[:j+1])
+            break
     return os.path.dirname(path)
 
 def load_blacklist(rm_list_path):
