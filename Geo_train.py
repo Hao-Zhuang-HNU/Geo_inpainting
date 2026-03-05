@@ -180,12 +180,12 @@ def append_simple_log(ckpt_path, message):
 
 
 def dump_debug_line_panels(dataset, seq_to_indices, out_dir="debug_line", frames_per_seq=10, logger=None,
-                           no_align=False, no_global_ref=False, no_local_ref=False):
+                           local_used_gt=False, no_global_ref=False, no_local_ref=False):
     """
     For each sequence, sample up to `frames_per_seq` frames and dump a concatenated panel:
     [local_ref_line | global_ref_line | frame_line].
     All line maps are loaded via dataset.load_wireframe to ensure consistency.
-    no_align=True: local_ref_line uses current frame line (GT) to match training no_align branch.
+    local_used_gt=True: local_ref_line uses current frame line (GT) to match training local_used_gt branch.
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -235,7 +235,7 @@ def dump_debug_line_panels(dataset, seq_to_indices, out_dir="debug_line", frames
 
             if no_local_ref:
                 local_line = np.zeros_like(curr_line)
-            elif no_align:
+            elif local_used_gt:
                 local_line = curr_line.copy()
             elif pos > 0:
                 local_idx = sorted_idxs[pos - 1]
@@ -255,15 +255,16 @@ def dump_debug_line_panels(dataset, seq_to_indices, out_dir="debug_line", frames
 # ============================================================
 
 class MaPDatasetWrapper(Dataset):
-    def __init__(self, dataset, seq_to_indices, npz_path_list=None, logger=None, no_align=False,
-                 no_global_ref=False, no_local_ref=False):
+    def __init__(self, dataset, seq_to_indices, npz_path_list=None, logger=None, local_used_gt=False,
+                 no_global_ref=False, no_local_ref=False, local_used_last_frame=False):
         self.dataset = dataset
         self.seq_to_indices = seq_to_indices
         self.npz_path_list = npz_path_list
         self.logger = logger
-        self.no_align = no_align  # ablation
+        self.local_used_gt = local_used_gt  # ablation
         self.no_global_ref = no_global_ref
         self.no_local_ref = no_local_ref
+        self.local_used_last_frame = local_used_last_frame
         self.idx_to_seq = {}
         self.idx_info = {} 
         
@@ -347,11 +348,28 @@ class MaPDatasetWrapper(Dataset):
         l_edge_t, l_line_t, l_mask_t = None, None, None
         valid_local = False
 
-        # [修改] 增加 no_align 逻辑分支
+        # [修改] 增加 local_used_gt 逻辑分支
         if self.no_local_ref:
             valid_local = False
         elif not info['is_first']:
-            if self.no_align:
+            if self.local_used_last_frame:
+                # 模式：不进行对齐，直接使用上一帧 GT 作为 local reference
+                try:
+                    prev_item = self.dataset[info['prev_idx']]
+                    l_edge_t = prev_item['edge'].clone()
+                    l_line_t = prev_item['line'].clone()
+                    l_mask_t = torch.zeros_like(curr_item['mask'])
+                    if l_mask_t.dim() == 2:
+                        l_mask_t = l_mask_t.unsqueeze(0)
+
+                    current_conf = 1.0
+                    warp_valid = 1.0
+                    npz_ok = 1.0
+                    valid_local = True
+                    local_used = 1.0
+                except Exception:
+                    pass
+            elif self.local_used_gt:
                 # 模式：不进行对齐，直接使用当前帧 GT 作为 local reference
                 try:
                     l_edge_t = curr_item['edge'].clone()
@@ -434,9 +452,10 @@ def build_datasets_and_loader(opts, logger, train_npz_list=None):
         base_dataset.seq_to_indices, 
         npz_path_list=train_npz_list, 
         logger=logger,
-        no_align=getattr(opts, "no_align", False),  # ablation
+        local_used_gt=getattr(opts, "local_used_gt", False),  # ablation
         no_global_ref=getattr(opts, "no_global_ref", False),
         no_local_ref=getattr(opts, "no_local_ref", False),
+        local_used_last_frame=getattr(opts, "local_used_last_frame", False),
     )
     
     rank = int(getattr(opts, "rank", 0))
@@ -951,12 +970,15 @@ def evaluate_sequence(model, val_dataset, seq_to_ref, device, logger, amp, opts,
                 warp_valid = False
                 H_mat = np.eye(3, dtype=np.float32)
                 local_conf = 0.0
-                is_no_align = getattr(opts, "no_align", False) #ablation
+                is_local_used_gt = getattr(opts, "local_used_gt", False) #ablation
 
                 if getattr(opts, "no_local_ref", False):
                     warp_valid = False
                     local_conf = 0.0
-                elif is_no_align: #ablation
+                elif getattr(opts, "local_used_last_frame", False):
+                    warp_valid = True
+                    local_conf = 1.0
+                elif is_local_used_gt: #ablation
                     warp_valid = True
                     local_conf = 1.0 # 强制全通
                 elif (p_idx >= 0) and (val_npz_list is not None):
@@ -976,7 +998,12 @@ def evaluate_sequence(model, val_dataset, seq_to_ref, device, logger, amp, opts,
 
                 if warp_valid and (p_idx >= 0):
                     try:
-                        if is_no_align:
+                        if getattr(opts, "local_used_last_frame", False):
+                            meta_prev = val_dataset[p_idx]
+                            l_edge = _ensure_4d_float(meta_prev["edge"], device)
+                            l_line = _ensure_4d_float(meta_prev["line"], device)
+                            l_mask = torch.zeros_like(t_mask)
+                        elif is_local_used_gt:
                             # [修改] 直接使用当前帧 GT，不进行 Warp
                             l_edge = t_edge_gt
                             l_line = t_line_gt
@@ -1132,9 +1159,11 @@ def load_config_to_opts(opts):
     if 'val_mask_list' in mk: opts.valid_mask_path = str(mk['val_mask_list'])
 
     # 消融指标
-    if 'no_align' in tp: opts.no_align = bool(tp['no_align'])
+    if 'local_used_gt' in tp: opts.local_used_gt = bool(tp['local_used_gt'])
+    elif 'no_align' in tp: opts.local_used_gt = bool(tp['no_align'])
     if 'no_global_ref' in tp: opts.no_global_ref = bool(tp['no_global_ref'])
     if 'no_local_ref' in tp: opts.no_local_ref = bool(tp['no_local_ref'])
+    if 'local_used_last_frame' in tp: opts.local_used_last_frame = bool(tp['local_used_last_frame'])
     if 'debug_line' in tp: opts.debug_line = bool(tp['debug_line'])
     if 'debug_line_dir' in tp: opts.debug_line_dir = str(tp['debug_line_dir'])
 
@@ -1181,6 +1210,16 @@ def main_worker(opts):
             logger.info(f"[Config] Loaded from {opts.config_path}")
             with open(os.path.join(opts.ckpt_path, "config.yml"), "w") as f:
                 yaml.dump(opts.yaml_cfg, f)
+
+    if is_main:
+        logger.info("[Args] Runtime options:")
+        for k in sorted(vars(opts).keys()):
+            if k == "yaml_cfg":
+                continue
+            logger.info(f"  - {k}: {getattr(opts, k)}")
+
+    if bool(getattr(opts, "local_used_last_frame", False)) and bool(getattr(opts, "local_used_gt", False)):
+        raise ValueError("--local_used_last_frame and --local_used_gt cannot be enabled at the same time.")
 
     def read_list_file(path):
         ## 清单文件函数定义
@@ -1340,9 +1379,10 @@ def main_worker(opts):
             new_train_map, 
             npz_path_list=train_npz_list, 
             logger=logger,
-            no_align=getattr(opts, "no_align", False), # ablation
+            local_used_gt=getattr(opts, "local_used_gt", False), # ablation
             no_global_ref=getattr(opts, "no_global_ref", False),
             no_local_ref=getattr(opts, "no_local_ref", False),
+            local_used_last_frame=getattr(opts, "local_used_last_frame", False),
         )
                 # [DDP Fix] Distribute by frame-level "clips" rather than by sequences.
         rank = int(getattr(opts, "rank", 0))
@@ -1386,7 +1426,7 @@ def main_worker(opts):
             out_dir=debug_line_dir,
             frames_per_seq=10,
             logger=logger,
-            no_align=getattr(opts, "no_align", False),
+            local_used_gt=getattr(opts, "local_used_gt", False),
             no_global_ref=getattr(opts, "no_global_ref", False),
             no_local_ref=getattr(opts, "no_local_ref", False),
         )
@@ -1520,9 +1560,10 @@ if __name__ == "__main__":
     parser.add_argument("--dilate1_ep", type=int, default=1, help="Epoch to switch from dilate=3 to dilate=1.")
 
     #消融指标
-    parser.add_argument("--no_align", action="store_true", help="Do not align reference frames (use raw previous) and force IOU to 1.0")
+    parser.add_argument("--local_used_gt", action="store_true", help="Use current-frame GT as local reference without alignment and force IOU to 1.0")
     parser.add_argument("--no_global_ref", action="store_true", help="Do not use global reference frame; replace with empty tensors")
     parser.add_argument("--no_local_ref", action="store_true", help="Do not use local reference frame; replace with empty tensors")
+    parser.add_argument("--local_used_last_frame", action="store_true", help="Use previous frame GT as local reference without alignment")
     parser.add_argument("--debug_line", action="store_true", help="Dump local/global/current line panels for each sequence to local directory")
     parser.add_argument("--debug_line_dir", type=str, default="debug_line", help="Output directory for --debug_line panels")
     parser.add_argument("--check_ref_frame", action="store_true", help="Run reference-frame Chamfer check with wireframe/model-input dump and exit")
