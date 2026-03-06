@@ -6,6 +6,7 @@ import sys
 import random
 import time
 import collections
+import contextlib
 import yaml
 
 import torch
@@ -178,17 +179,93 @@ def append_simple_log(ckpt_path, message):
     with open(os.path.join(ckpt_path, "simplified_log.txt"), "a") as f:
         f.write(message + "\n")
 
+
+def dump_debug_line_panels(dataset, seq_to_indices, out_dir="debug_line", frames_per_seq=10, logger=None,
+                           local_used_gt=False, no_global_ref=False, no_local_ref=False):
+    """
+    For each sequence, sample up to `frames_per_seq` frames and dump a concatenated panel:
+    [local_ref_line | global_ref_line | frame_line].
+    All line maps are loaded via dataset.load_wireframe to ensure consistency.
+    local_used_gt=True: local_ref_line uses current frame line (GT) to match training local_used_gt branch.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    image_size = int(getattr(dataset, "image_size", 256))
+
+    def _load_line_by_idx(frame_idx):
+        img_path = dataset.image_id_list[frame_idx]
+        basename = os.path.splitext(os.path.basename(img_path))[0]
+        line = dataset.load_wireframe(basename, image_size)
+        if line is None:
+            line = np.zeros((image_size, image_size), dtype=np.float32)
+        line = np.asarray(line, dtype=np.float32)
+        if line.ndim == 3:
+            line = line[..., 0]
+        line = np.clip(line, 0.0, 1.0)
+        u8 = (line * 255.0).astype(np.uint8)
+        return cv2.cvtColor(u8, cv2.COLOR_GRAY2BGR)
+
+    for seq_id, idxs in seq_to_indices.items():
+        try:
+            paths = [dataset.image_id_list[i] for i in idxs]
+            sorted_pairs = sorted(zip(paths, idxs), key=lambda x: x[0])
+            sorted_idxs = [p[1] for p in sorted_pairs]
+        except Exception:
+            sorted_idxs = sorted(idxs)
+
+        if len(sorted_idxs) == 0:
+            continue
+
+        if len(sorted_idxs) <= frames_per_seq:
+            sample_pos = np.arange(len(sorted_idxs), dtype=np.int64)
+        else:
+            sample_pos = np.linspace(0, len(sorted_idxs) - 1, frames_per_seq, dtype=np.int64)
+            sample_pos = np.unique(sample_pos)
+
+        global_idx = sorted_idxs[0]
+        global_line = np.zeros((image_size, image_size, 3), dtype=np.uint8) if no_global_ref else _load_line_by_idx(global_idx)
+
+        safe_seq = str(seq_id).replace(os.sep, "_").replace(" ", "_")[:120]
+        seq_out_dir = os.path.join(out_dir, safe_seq)
+        os.makedirs(seq_out_dir, exist_ok=True)
+
+        for pos in sample_pos:
+            pos = int(pos)
+            curr_idx = sorted_idxs[pos]
+            curr_line = _load_line_by_idx(curr_idx)
+
+            if no_local_ref:
+                local_line = np.zeros_like(curr_line)
+            elif local_used_gt:
+                local_line = curr_line.copy()
+            elif pos > 0:
+                local_idx = sorted_idxs[pos - 1]
+                local_line = _load_line_by_idx(local_idx)
+            else:
+                local_line = np.zeros_like(curr_line)
+
+            panel = cv2.hconcat([local_line, global_line, curr_line])
+            save_name = f"{pos:03d}_idx{curr_idx:06d}.png"
+            cv2.imwrite(os.path.join(seq_out_dir, save_name), panel)
+
+    if logger is not None:
+        logger.info(f"[DebugLine] Saved line panels to: {out_dir}")
+
 # ============================================================
 #  Dataset Components
 # ============================================================
 
 class MaPDatasetWrapper(Dataset):
-    def __init__(self, dataset, seq_to_indices, npz_path_list=None, logger=None, no_align=False):
+    def __init__(self, dataset, seq_to_indices, npz_path_list=None, logger=None, local_used_gt=False,
+                 no_global_ref=False, no_local_ref=False, local_used_last_frame=False):
         self.dataset = dataset
         self.seq_to_indices = seq_to_indices
         self.npz_path_list = npz_path_list
         self.logger = logger
-        self.no_align = no_align  # ablation
+        self.local_used_gt = local_used_gt  # ablation
+        self.no_global_ref = no_global_ref
+        self.no_local_ref = no_local_ref
+        self.local_used_last_frame = local_used_last_frame
         self.idx_to_seq = {}
         self.idx_info = {} 
         
@@ -257,7 +334,10 @@ class MaPDatasetWrapper(Dataset):
         is_first = 1.0 if info['is_first'] else 0.0
         
         # 2. Global Ref 数据
-        if idx == info['global_idx']:
+        if self.no_global_ref:
+            g_edge = torch.zeros_like(curr_item['edge'])
+            g_line = torch.zeros_like(curr_item['line'])
+        elif idx == info['global_idx']:
             g_edge = curr_item['edge']
             g_line = curr_item['line']
         else:
@@ -269,9 +349,28 @@ class MaPDatasetWrapper(Dataset):
         l_edge_t, l_line_t, l_mask_t = None, None, None
         valid_local = False
 
-        # [修改] 增加 no_align 逻辑分支
-        if not info['is_first']:
-            if self.no_align:
+        # [修改] 增加 local_used_gt 逻辑分支
+        if self.no_local_ref:
+            valid_local = False
+        elif not info['is_first']:
+            if self.local_used_last_frame:
+                # 模式：不进行对齐，直接使用上一帧 GT 作为 local reference
+                try:
+                    prev_item = self.dataset[info['prev_idx']]
+                    l_edge_t = prev_item['edge'].clone()
+                    l_line_t = prev_item['line'].clone()
+                    l_mask_t = torch.zeros_like(curr_item['mask'])
+                    if l_mask_t.dim() == 2:
+                        l_mask_t = l_mask_t.unsqueeze(0)
+
+                    current_conf = 1.0
+                    warp_valid = 1.0
+                    npz_ok = 1.0
+                    valid_local = True
+                    local_used = 1.0
+                except Exception:
+                    pass
+            elif self.local_used_gt:
                 # 模式：不进行对齐，直接使用当前帧 GT 作为 local reference
                 try:
                     l_edge_t = curr_item['edge'].clone()
@@ -354,7 +453,10 @@ def build_datasets_and_loader(opts, logger, train_npz_list=None):
         base_dataset.seq_to_indices, 
         npz_path_list=train_npz_list, 
         logger=logger,
-        no_align=getattr(opts, "no_align", False)  # ablation
+        local_used_gt=getattr(opts, "local_used_gt", False),  # ablation
+        no_global_ref=getattr(opts, "no_global_ref", False),
+        no_local_ref=getattr(opts, "no_local_ref", False),
+        local_used_last_frame=getattr(opts, "local_used_last_frame", False),
     )
     
     rank = int(getattr(opts, "rank", 0))
@@ -452,7 +554,7 @@ def build_seq_ref_feats(model, dataset, device, opts):
 
 def train_one_epoch_optimized(model, train_loader, dataset_obj, optimizer, device, scaler, logger, epoch, amp, opts, scheduler, writer=None, global_step=0):
     model.train()
-    
+
     if epoch < opts.dilate1_ep:
         current_dilate = 3
     else:
@@ -462,206 +564,201 @@ def train_one_epoch_optimized(model, train_loader, dataset_obj, optimizer, devic
         logger.info(f"[Curriculum] Epoch {epoch}: GT Dilate={current_dilate}")
 
     criterion = EdgeLineLoss(
-        focal_weight=opts.focal_weight, 
+        focal_weight=opts.focal_weight,
         tversky_weight=opts.tversky_weight,
-        alpha=opts.line_tv_alpha, 
+        alpha=opts.line_tv_alpha,
         beta=opts.line_tv_beta
     )
-    
+
     total_loss, total_samples = 0.0, 0
     raw_model = model.module if isinstance(model, DDP) else model
-    
-    for it, batch in enumerate(train_loader):
-        B = batch['c_img'].size(0)
-        
-        c_img = batch['c_img'].to(device, non_blocking=True)
-        c_edge = batch['c_edge'].to(device, non_blocking=True)
-        c_line = batch['c_line'].to(device, non_blocking=True)
-        c_mask = batch['c_mask'].to(device, non_blocking=True)
-        g_edge = batch['g_edge'].to(device, non_blocking=True)
-        g_line = batch['g_line'].to(device, non_blocking=True)
-        l_edge = batch['l_edge'].to(device, non_blocking=True)
-        l_line = batch['l_line'].to(device, non_blocking=True)
-        l_mask = batch['l_mask'].to(device, non_blocking=True)
-        local_conf = batch.get("conf", None)  # [ADD] confidence_iou from npz
-        if local_conf is not None:
-            local_conf = local_conf.to(device=device, non_blocking=True, dtype=torch.float32)
-            #消融：如果启用 no_gate，强制将置信度设为 1.0 (全通)
-            if getattr(opts, "no_gate", False):
-                local_conf = torch.ones_like(local_conf)
 
-        npz_ok = batch.get("npz_ok", None)
-        warp_valid = batch.get("warp_valid", None)
-        local_used = batch.get("local_used", None)
-        is_first = batch.get("is_first", None)
+    ddp_join_ctx = model.join(throw_on_early_termination=False) if isinstance(model, DDP) else contextlib.nullcontext()
+    with ddp_join_ctx:
+        for it, batch in enumerate(train_loader):
+            B = batch['c_img'].size(0)
 
-        if npz_ok is not None: npz_ok = npz_ok.to(device=device, non_blocking=True, dtype=torch.float32)
-        if warp_valid is not None: warp_valid = warp_valid.to(device=device, non_blocking=True, dtype=torch.float32)
-        if local_used is not None: local_used = local_used.to(device=device, non_blocking=True, dtype=torch.float32)
-        if is_first is not None: is_first = is_first.to(device=device, non_blocking=True, dtype=torch.float32)
+            c_img = batch['c_img'].to(device, non_blocking=True)
+            c_edge = batch['c_edge'].to(device, non_blocking=True)
+            c_line = batch['c_line'].to(device, non_blocking=True)
+            c_mask = batch['c_mask'].to(device, non_blocking=True)
+            g_edge = batch['g_edge'].to(device, non_blocking=True)
+            g_line = batch['g_line'].to(device, non_blocking=True)
+            l_edge = batch['l_edge'].to(device, non_blocking=True)
+            l_line = batch['l_line'].to(device, non_blocking=True)
+            l_mask = batch['l_mask'].to(device, non_blocking=True)
+            local_conf = batch.get("conf", None)
+            if local_conf is not None:
+                local_conf = local_conf.to(device=device, non_blocking=True, dtype=torch.float32)
+                if getattr(opts, "no_gate", False):
+                    local_conf = torch.ones_like(local_conf)
 
-        # only diagnose non-first frames (more meaningful)
-        non_first = None
-        if is_first is not None:
-            non_first = (1.0 - is_first).clamp(0, 1)  # [B]
-            denom_nf = non_first.sum().clamp_min(1.0)
-        else:
-            denom_nf = torch.tensor(float(B), device=device)
+            npz_ok = batch.get("npz_ok", None)
+            warp_valid = batch.get("warp_valid", None)
+            local_used = batch.get("local_used", None)
+            is_first = batch.get("is_first", None)
 
-        # [修改] 移除了原有的 known 区域掩码计算和 _binary_iou 实时计算代码
-        # 仅依赖从 batch 中读取的 local_conf (即 npz 中的 confidence_iou)
+            if npz_ok is not None:
+                npz_ok = npz_ok.to(device=device, non_blocking=True, dtype=torch.float32)
+            if warp_valid is not None:
+                warp_valid = warp_valid.to(device=device, non_blocking=True, dtype=torch.float32)
+            if local_used is not None:
+                local_used = local_used.to(device=device, non_blocking=True, dtype=torch.float32)
+            if is_first is not None:
+                is_first = is_first.to(device=device, non_blocking=True, dtype=torch.float32)
 
-        # handle "empty line" cases (optional)
-        empty_gt = (c_line.flatten(1).sum(1) == 0).float()
-        empty_local = (l_line.flatten(1).sum(1) == 0).float()
+            disable_global_ref = bool(getattr(opts, "no_global_ref", False))
+            disable_local_ref = bool(getattr(opts, "no_local_ref", False))
 
-        # periodic logging (rank0 only)
-        if dist.get_rank() == 0 and ((it % 50) == 0):
-            # ratios (prefer non-first)
-            if non_first is not None:
-                npz_ok_ratio = (npz_ok * non_first).sum() / denom_nf if npz_ok is not None else torch.tensor(0.0, device=device)
-                warp_valid_ratio = (warp_valid * non_first).sum() / denom_nf if warp_valid is not None else torch.tensor(0.0, device=device)
-                local_used_ratio = (local_used * non_first).sum() / denom_nf if local_used is not None else torch.tensor(0.0, device=device)
-
-                conf_nf = (local_conf * non_first) if local_conf is not None else None
-                conf_mean = conf_nf.sum() / denom_nf if conf_nf is not None else torch.tensor(0.0, device=device)
+            non_first = None
+            if is_first is not None:
+                non_first = (1.0 - is_first).clamp(0, 1)
+                denom_nf = non_first.sum().clamp_min(1.0)
             else:
-                npz_ok_ratio = npz_ok.mean() if npz_ok is not None else torch.tensor(0.0, device=device)
-                warp_valid_ratio = warp_valid.mean() if warp_valid is not None else torch.tensor(0.0, device=device)
-                local_used_ratio = local_used.mean() if local_used is not None else torch.tensor(0.0, device=device)
-                conf_mean = local_conf.mean() if local_conf is not None else torch.tensor(0.0, device=device)
+                denom_nf = torch.tensor(float(B), device=device)
 
-            conf_min = local_conf.min() if local_conf is not None else torch.tensor(0.0, device=device)
-            conf_max = local_conf.max() if local_conf is not None else torch.tensor(0.0, device=device)
+            empty_gt = (c_line.flatten(1).sum(1) == 0).float()
+            empty_local = (l_line.flatten(1).sum(1) == 0).float()
 
-            # [修改] 日志字符串中移除了 iou_known 和 iou_all
-            logger.info(
-                f"[Diag][Ep{epoch} It{it}] "
-                f"npz_ok={npz_ok_ratio.item():.3f} warp_valid={warp_valid_ratio.item():.3f} local_used={local_used_ratio.item():.3f} | "
-                f"conf(mean/min/max)={conf_mean.item():.3f}/{conf_min.item():.3f}/{conf_max.item():.3f} | "
-                f"empty_gt={float(empty_gt.mean().item()):.3f} empty_local={float(empty_local.mean().item()):.3f}"
-            )
+            if dist.get_rank() == 0 and ((it % 50) == 0):
+                if non_first is not None:
+                    npz_ok_ratio = (npz_ok * non_first).sum() / denom_nf if npz_ok is not None else torch.tensor(0.0, device=device)
+                    warp_valid_ratio = (warp_valid * non_first).sum() / denom_nf if warp_valid is not None else torch.tensor(0.0, device=device)
+                    local_used_ratio = (local_used * non_first).sum() / denom_nf if local_used is not None else torch.tensor(0.0, device=device)
 
-            if writer is not None:
-                step = global_step + it
-                writer.add_scalar("diag/npz_ok_ratio", float(npz_ok_ratio.item()), step)
-                writer.add_scalar("diag/warp_valid_ratio", float(warp_valid_ratio.item()), step)
-                writer.add_scalar("diag/local_used_ratio", float(local_used_ratio.item()), step)
-                writer.add_scalar("diag/conf_mean", float(conf_mean.item()), step)
-                writer.add_scalar("diag/conf_min", float(conf_min.item()), step)
-                writer.add_scalar("diag/conf_max", float(conf_max.item()), step)
-                # [修改] 移除了 diag/iou_known_mean 和 diag/iou_all_mean 的 TensorBoard 写入
-            
-        for t in [c_mask, c_edge, c_line, l_mask, l_edge, l_line, g_edge, g_line]:
-            if t.dim() == 3: t.unsqueeze_(1)
+                    conf_nf = (local_conf * non_first) if local_conf is not None else None
+                    conf_mean = conf_nf.sum() / denom_nf if conf_nf is not None else torch.tensor(0.0, device=device)
+                else:
+                    npz_ok_ratio = npz_ok.mean() if npz_ok is not None else torch.tensor(0.0, device=device)
+                    warp_valid_ratio = warp_valid.mean() if warp_valid is not None else torch.tensor(0.0, device=device)
+                    local_used_ratio = local_used.mean() if local_used is not None else torch.tensor(0.0, device=device)
+                    conf_mean = local_conf.mean() if local_conf is not None else torch.tensor(0.0, device=device)
 
-        optimizer.zero_grad(set_to_none=True)
+                conf_min = local_conf.min() if local_conf is not None else torch.tensor(0.0, device=device)
+                conf_max = local_conf.max() if local_conf is not None else torch.tensor(0.0, device=device)
 
-        with torch.amp.autocast('cuda', enabled=amp, dtype=torch.bfloat16):
-            ref_feat = raw_model.extract_reference_features(
-                global_img=None, global_edge=g_edge, global_line=g_line,
-                local_img=None, local_edge=l_edge, local_line=l_line, local_mask=l_mask,
-            )
-            
-            edge_logits, line_logits = raw_model.forward_with_logits(
-                img_idx=c_img, edge_idx=c_edge, line_idx=c_line, masks=c_mask, ref_feat=ref_feat
-            )
-            
-            target_edge = dilate_tensor(c_edge, kernel_size=current_dilate)
-            target_line = dilate_tensor(c_line, kernel_size=current_dilate)
-            
-            loss_line = criterion(line_logits, target_line)
-            
-            if opts.disable_edge:
-                loss = loss_line
-            else:
-                loss_edge = criterion(edge_logits, target_edge)
-                loss = (loss_edge + loss_line)
-        
-        if torch.isnan(loss) or torch.isinf(loss):
-            # 将 loss 抹零，使其产生 全0梯度，参与 DDP 同步
-            loss = loss * 0.0 
-        loss.backward()
-        
-        if check_grads_finite(model):
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-        
-        total_loss += loss.item() * B
-        total_samples += B
-        
-        if opts.tb_images and writer is not None and dist.get_rank() == 0:
-            should_log = (it % 100 == 0)
-            if should_log:
-                try:
-                    curr_orig_idx = batch['orig_idx'][0].item()
-                    seq_id_val = train_wrapper.idx_to_seq.get(curr_orig_idx, "unknown")
-                    seq_name = str(seq_id_val)[:10]
-                except:
-                    seq_name = "unknown"
+                logger.info(
+                    f"[Diag][Ep{epoch} It{it}] "
+                    f"npz_ok={npz_ok_ratio.item():.3f} warp_valid={warp_valid_ratio.item():.3f} local_used={local_used_ratio.item():.3f} | "
+                    f"conf(mean/min/max)={conf_mean.item():.3f}/{conf_min.item():.3f}/{conf_max.item():.3f} | "
+                    f"empty_gt={float(empty_gt.mean().item()):.3f} empty_local={float(empty_local.mean().item()):.3f}"
+                )
 
-                with torch.no_grad():
-                    sample_idx = 0
+                if writer is not None:
                     step = global_step + it
+                    writer.add_scalar("diag/npz_ok_ratio", float(npz_ok_ratio.item()), step)
+                    writer.add_scalar("diag/warp_valid_ratio", float(warp_valid_ratio.item()), step)
+                    writer.add_scalar("diag/local_used_ratio", float(local_used_ratio.item()), step)
+                    writer.add_scalar("diag/conf_mean", float(conf_mean.item()), step)
+                    writer.add_scalar("diag/conf_min", float(conf_min.item()), step)
+                    writer.add_scalar("diag/conf_max", float(conf_max.item()), step)
 
-                    # 1. Input image - 使用clone避免引用原tensor
-                    img_vis = (c_img[sample_idx].clone() * 0.5 + 0.5).clamp(0, 1)
-                    writer.add_image(f"train/{seq_name}/1_input", img_vis.cpu(), step)
-                    del img_vis  # 立即删除
+            for t in [c_mask, c_edge, c_line, l_mask, l_edge, l_line, g_edge, g_line]:
+                if t.dim() == 3:
+                    t.unsqueeze_(1)
 
-                    # 2. Overlay line - 使用clone并立即转CPU
-                    line_pred = torch.sigmoid(line_logits[sample_idx:sample_idx+1].clone()).clamp(0, 1)
-                    line_gt = c_line[sample_idx:sample_idx+1].clone()
-                    local_warp_line = l_line[sample_idx:sample_idx+1].clone().clamp(0, 1)
+            optimizer.zero_grad(set_to_none=True)
 
-                    alpha_blue = 0.3
-                    blue_chan = (local_warp_line[0] * alpha_blue).clamp(0, 1)
+            with torch.amp.autocast('cuda', enabled=amp, dtype=torch.bfloat16):
+                g_img_in = torch.zeros_like(c_img)
+                g_edge_in = torch.zeros_like(g_edge) if disable_global_ref else g_edge
+                g_line_in = torch.zeros_like(g_line) if disable_global_ref else g_line
+                l_img_in = torch.zeros_like(c_img)
+                l_edge_in = torch.zeros_like(l_edge) if disable_local_ref else l_edge
+                l_line_in = torch.zeros_like(l_line) if disable_local_ref else l_line
+                l_mask_in = torch.ones_like(l_mask) if disable_local_ref else l_mask
 
-                    line_overlay = torch.cat([line_gt[0], line_pred[0], blue_chan], dim=0)
-                    writer.add_image(f"train/{seq_name}/2_overlay_line", line_overlay.cpu(), step)
+                ref_feat = raw_model.extract_reference_features(
+                    global_img=g_img_in, global_edge=g_edge_in, global_line=g_line_in,
+                    local_img=l_img_in, local_edge=l_edge_in, local_line=l_line_in, local_mask=l_mask_in,
+                )
 
-                    # 立即删除所有中间变量
-                    del line_pred, line_gt, local_warp_line, blue_chan, line_overlay
+                edge_logits, line_logits = raw_model.forward_with_logits(
+                    img_idx=c_img, edge_idx=c_edge, line_idx=c_line, masks=c_mask, ref_feat=ref_feat
+                )
 
-                    # 3. Local reference line
-                    l_line_vis = l_line[sample_idx].clone().clamp(0, 1)
-                    writer.add_image(f"train/{seq_name}/3_local_ref_line", l_line_vis.cpu(), step)
-                    del l_line_vis
+                target_edge = dilate_tensor(c_edge, kernel_size=current_dilate)
+                target_line = dilate_tensor(c_line, kernel_size=current_dilate)
 
-                    # 4. Predicted line
-                    pred_vis = torch.sigmoid(line_logits[sample_idx:sample_idx+1].clone()).clamp(0, 1)
-                    writer.add_image(f"train/{seq_name}/4_pred_line", pred_vis[0].cpu(), step)
-                    del pred_vis
+                loss_line = criterion(line_logits, target_line)
 
-                    # 5. Global reference line
-                    g_line_vis = g_edge[sample_idx].clone().clamp(0, 1)
-                    writer.add_image(f"train/{seq_name}/5_global_ref_line", g_line_vis.cpu(), step)
-                    del g_line_vis
+                if opts.disable_edge:
+                    loss = loss_line
+                else:
+                    loss_edge = criterion(edge_logits, target_edge)
+                    loss = (loss_edge + loss_line)
 
-                    # 强制清理显存
-                    torch.cuda.empty_cache()
-        current_loss_val = loss.item()  
-        del loss, edge_logits, line_logits, ref_feat
-        del c_img, c_edge, c_line, c_mask
-        del g_edge, g_line
-        del l_edge, l_line, l_mask
-        
-        # 清理batch中的其他tensor
-        if local_conf is not None:
-            del local_conf
-        if npz_ok is not None:
-            del npz_ok, warp_valid, local_used, is_first
-        
-        # 每50个iteration强制清理一次
-        if (it + 1) % 50 == 0 and dist.get_rank() == 0:
-            logger.info(f"[SeqTrain] Ep {epoch} It {it+1}/{len(train_loader)} Loss {current_loss_val:.4f}")
-            torch.cuda.empty_cache()
+            if torch.isnan(loss) or torch.isinf(loss):
+                loss = loss * 0.0
+            loss.backward()
+
+            if check_grads_finite(model):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+
+            total_loss += loss.item() * B
+            total_samples += B
+
+            if opts.tb_images and writer is not None and dist.get_rank() == 0:
+                should_log = (it % 100 == 0)
+                if should_log:
+                    try:
+                        curr_orig_idx = batch['orig_idx'][0].item()
+                        seq_id_val = train_wrapper.idx_to_seq.get(curr_orig_idx, "unknown")
+                        seq_name = str(seq_id_val)[:10]
+                    except:
+                        seq_name = "unknown"
+
+                    with torch.no_grad():
+                        sample_idx = 0
+                        step = global_step + it
+                        img_vis = (c_img[sample_idx].clone() * 0.5 + 0.5).clamp(0, 1)
+                        writer.add_image(f"train/{seq_name}/1_input", img_vis.cpu(), step)
+                        del img_vis
+
+                        line_pred = torch.sigmoid(line_logits[sample_idx:sample_idx+1].clone()).clamp(0, 1)
+                        line_gt = c_line[sample_idx:sample_idx+1].clone()
+                        local_warp_line = l_line[sample_idx:sample_idx+1].clone().clamp(0, 1)
+
+                        alpha_blue = 0.3
+                        blue_chan = (local_warp_line[0] * alpha_blue).clamp(0, 1)
+                        line_overlay = torch.cat([line_gt[0], line_pred[0], blue_chan], dim=0)
+                        writer.add_image(f"train/{seq_name}/2_overlay_line", line_overlay.cpu(), step)
+                        del line_pred, line_gt, local_warp_line, blue_chan, line_overlay
+
+                        l_line_vis = l_line[sample_idx].clone().clamp(0, 1)
+                        writer.add_image(f"train/{seq_name}/3_local_ref_line", l_line_vis.cpu(), step)
+                        del l_line_vis
+
+                        pred_vis = torch.sigmoid(line_logits[sample_idx:sample_idx+1].clone()).clamp(0, 1)
+                        writer.add_image(f"train/{seq_name}/4_pred_line", pred_vis[0].cpu(), step)
+                        del pred_vis
+
+                        g_line_vis = g_edge[sample_idx].clone().clamp(0, 1)
+                        writer.add_image(f"train/{seq_name}/5_global_ref_line", g_line_vis.cpu(), step)
+                        del g_line_vis
+
+                        torch.cuda.empty_cache()
+            current_loss_val = loss.item()
+            del loss, edge_logits, line_logits, ref_feat
+            del c_img, c_edge, c_line, c_mask
+            del g_edge, g_line
+            del l_edge, l_line, l_mask
+
+            if local_conf is not None:
+                del local_conf
+            if npz_ok is not None:
+                del npz_ok, warp_valid, local_used, is_first
+
+            if (it + 1) % 50 == 0 and dist.get_rank() == 0:
+                logger.info(f"[SeqTrain] Ep {epoch} It {it+1}/{len(train_loader)} Loss {current_loss_val:.4f}")
+                torch.cuda.empty_cache()
 
     total_loss_tensor = torch.tensor(total_loss, device=device)
     total_samples_tensor = torch.tensor(total_samples, device=device)
     dist.all_reduce(total_loss_tensor, op=dist.ReduceOp.SUM)
     dist.all_reduce(total_samples_tensor, op=dist.ReduceOp.SUM)
-    
+
     return total_loss_tensor.item() / max(1, total_samples_tensor.item()), global_step + len(train_loader)
 
 def prepare_fixed_validation_set(opts, val_dataset, logger):
@@ -837,6 +934,9 @@ def evaluate_sequence(model, val_dataset, seq_to_ref, device, logger, amp, opts,
                 _, g_edge, g_line = _build_clean_ref_sample(
                     val_dataset, g_idx, getattr(opts, "image_size", 256), device
                 )
+                if getattr(opts, "no_global_ref", False):
+                    g_edge = torch.zeros_like(g_edge)
+                    g_line = torch.zeros_like(g_line)
 
                 # Target frame
                 meta_tgt = val_dataset[t_idx]
@@ -853,9 +953,15 @@ def evaluate_sequence(model, val_dataset, seq_to_ref, device, logger, amp, opts,
                 warp_valid = False
                 H_mat = np.eye(3, dtype=np.float32)
                 local_conf = 0.0
-                is_no_align = getattr(opts, "no_align", False) #ablation
+                is_local_used_gt = getattr(opts, "local_used_gt", False) #ablation
 
-                if is_no_align: #ablation
+                if getattr(opts, "no_local_ref", False):
+                    warp_valid = False
+                    local_conf = 0.0
+                elif getattr(opts, "local_used_last_frame", False):
+                    warp_valid = True
+                    local_conf = 1.0
+                elif is_local_used_gt: #ablation
                     warp_valid = True
                     local_conf = 1.0 # 强制全通
                 elif (p_idx >= 0) and (val_npz_list is not None):
@@ -875,7 +981,12 @@ def evaluate_sequence(model, val_dataset, seq_to_ref, device, logger, amp, opts,
 
                 if warp_valid and (p_idx >= 0):
                     try:
-                        if is_no_align:
+                        if getattr(opts, "local_used_last_frame", False):
+                            meta_prev = val_dataset[p_idx]
+                            l_edge = _ensure_4d_float(meta_prev["edge"], device)
+                            l_line = _ensure_4d_float(meta_prev["line"], device)
+                            l_mask = torch.zeros_like(t_mask)
+                        elif is_local_used_gt:
                             # [修改] 直接使用当前帧 GT，不进行 Warp
                             l_edge = t_edge_gt
                             l_line = t_line_gt
@@ -895,9 +1006,19 @@ def evaluate_sequence(model, val_dataset, seq_to_ref, device, logger, amp, opts,
 
                 with torch.amp.autocast('cuda', enabled=bool(amp), dtype=torch.bfloat16):
                     local_conf_t = torch.tensor([local_conf], device=device, dtype=torch.float32)
+                    disable_global_ref = bool(getattr(opts, "no_global_ref", False))
+                    disable_local_ref = bool(getattr(opts, "no_local_ref", False))
+                    # Use same-resolution blank images instead of None for reference-image inputs.
+                    g_img_in = torch.zeros_like(t_img)
+                    g_edge_in = torch.zeros_like(g_edge) if disable_global_ref else g_edge
+                    g_line_in = torch.zeros_like(g_line) if disable_global_ref else g_line
+                    l_img_in = torch.zeros_like(t_img)
+                    l_edge_in = torch.zeros_like(l_edge) if disable_local_ref else l_edge
+                    l_line_in = torch.zeros_like(l_line) if disable_local_ref else l_line
+                    l_mask_in = torch.ones_like(l_mask) if disable_local_ref else l_mask
                     ref_feat = raw_model.extract_reference_features(
-                        global_img=None, global_edge=g_edge, global_line=g_line,
-                        local_img=None, local_edge=l_edge, local_line=l_line, local_mask=l_mask,
+                        global_img=g_img_in, global_edge=g_edge_in, global_line=g_line_in,
+                        local_img=l_img_in, local_edge=l_edge_in, local_line=l_line_in, local_mask=l_mask_in,
                     )
                     edge_logits, line_logits = raw_model.forward_with_logits(
                         img_idx=t_img, edge_idx=t_edge_gt, line_idx=t_line_gt, masks=t_mask, ref_feat=ref_feat
@@ -1021,7 +1142,13 @@ def load_config_to_opts(opts):
     if 'val_mask_list' in mk: opts.valid_mask_path = str(mk['val_mask_list'])
 
     # 消融指标
-    if 'no_align' in tp: opts.no_align = bool(tp['no_align'])
+    if 'local_used_gt' in tp: opts.local_used_gt = bool(tp['local_used_gt'])
+    elif 'no_align' in tp: opts.local_used_gt = bool(tp['no_align'])
+    if 'no_global_ref' in tp: opts.no_global_ref = bool(tp['no_global_ref'])
+    if 'no_local_ref' in tp: opts.no_local_ref = bool(tp['no_local_ref'])
+    if 'local_used_last_frame' in tp: opts.local_used_last_frame = bool(tp['local_used_last_frame'])
+    if 'debug_line' in tp: opts.debug_line = bool(tp['debug_line'])
+    if 'debug_line_dir' in tp: opts.debug_line_dir = str(tp['debug_line_dir'])
 
     
     # Store cfg for dataset loading in main
@@ -1040,29 +1167,26 @@ def main_worker(opts):
     os.makedirs(opts.ckpt_path, exist_ok=True)
     logger = build_logger(opts.ckpt_path)
     
+    ## 多卡环境导入（等待30分钟）
     if opts.dist:
             local_rank = int(os.environ.get("LOCAL_RANK", "0"))
             rank = int(os.environ.get("RANK", "0"))
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
-
-            # [修改] 引入 datetime 并设置 timeout 为 30 分钟
             import datetime
             dist.init_process_group(
                 backend="nccl", 
                 init_method="env://", 
-                timeout=datetime.timedelta(minutes=30) # 增加超时容忍度
+                timeout=datetime.timedelta(minutes=30)
             )
             torch.cuda.set_device(local_rank)
             device = torch.device(f"cuda:{local_rank}")
     else:
         local_rank, rank, world_size = 0, 0, 1
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
     opts.rank = rank
     opts.world_size = world_size
     opts.local_rank = local_rank
     is_main = (rank == 0)
-    
     if is_main:
         logger.info(f"[SYS] Device: {device} | DDP: {opts.dist} | GPUs: {world_size}")
         if opts.config_path:
@@ -1070,14 +1194,23 @@ def main_worker(opts):
             with open(os.path.join(opts.ckpt_path, "config.yml"), "w") as f:
                 yaml.dump(opts.yaml_cfg, f)
 
-    # ... (Helpers: read_list_file, combine_datasets_from_yaml, save_temp_list - OMITTED FOR BREVITY, SAME AS BEFORE) ...
+    if is_main:
+        logger.info("[Args] Runtime options:")
+        for k in sorted(vars(opts).keys()):
+            if k == "yaml_cfg":
+                continue
+            logger.info(f"  - {k}: {getattr(opts, k)}")
+
+    if bool(getattr(opts, "local_used_last_frame", False)) and bool(getattr(opts, "local_used_gt", False)):
+        raise ValueError("--local_used_last_frame and --local_used_gt cannot be enabled at the same time.")
+
     def read_list_file(path):
+        ## 清单文件函数定义
         if not path or not os.path.isfile(path): return []
         with open(path, 'r') as f: return [line.strip() for line in f.readlines() if line.strip()]
 
     def combine_datasets_from_yaml(cfg, mode='train'):
-        # ... (Same as original code) ...
-        # (This block is large and unchanged, imagine it is here)
+        ## 在yaml的dataset1, dataset2中依次读取词条img_list, pkl_list, npz_list
         def get_seq_id(path):
             try:
                 norm_path = os.path.normpath(path)
@@ -1087,54 +1220,43 @@ def main_worker(opts):
                     if len(part) > 15: return part
                 return os.path.dirname(norm_path)
             except: return os.path.dirname(path)
-
         dataset_info_list = []
         for ds_key in ['dataset1', 'dataset2']:
             ds = cfg.get(ds_key, {})
             if not ds.get('enable', False): continue
-            
             prefix = f"{mode}_"
             img_list = read_list_file(ds.get(f"{prefix}imgs_list"))
             pkl_list = read_list_file(ds.get(f"{prefix}pkls_list"))
             npz_list = read_list_file(ds.get(f"{prefix}npzs_list"))
-            
             if not img_list: continue
-            
             seq_groups = collections.defaultdict(lambda: {'img': [], 'pkl': [], 'npz': []})
             has_npz = (len(npz_list) == len(img_list))
-
             for i, img_path in enumerate(img_list):
                 sid = get_seq_id(img_path)
                 seq_groups[sid]['img'].append(img_path)
                 seq_groups[sid]['pkl'].append(pkl_list[i])
                 if has_npz: seq_groups[sid]['npz'].append(npz_list[i])
-            
             dataset_info_list.append({
                 'name': ds.get('name', ds_key),
                 'seq_groups': seq_groups,
                 'seq_count': len(seq_groups),
                 'ratio': float(ds.get('ratio', 1.0))
             })
-
         if not dataset_info_list: return [], [], []
-
         final_img, final_pkl, final_npz = [], [], []
-        
-        # ... logic for ratio mixing ... (omitted for brevity, assume original logic)
         for d in dataset_info_list:
              for sid in sorted(list(d['seq_groups'].keys())):
                 group = d['seq_groups'][sid]
                 final_img.extend(group['img'])
                 final_pkl.extend(group['pkl'])
                 final_npz.extend(group['npz'])
-
         return final_img, final_pkl, final_npz
-    # ... (End of helpers) ...
 
-    # ... (Temp file writing & Dataset building) ...
+    ## 临时列表和数据集文件的建立，减少内存占用
     temp_dir = os.path.join(opts.ckpt_path, "temp_lists")
     os.makedirs(temp_dir, exist_ok=True)
     def save_temp_list(data, name):
+        ## 把列表写到ckpt_path/temp_lists/*.txt，减少内存占用
         p = os.path.join(temp_dir, name)
         with open(p, 'w') as f: f.write('\n'.join(data))
         return p
@@ -1155,9 +1277,7 @@ def main_worker(opts):
 
         
         
-    # =========================================================
-    #  [ADD] Pre-training File Existence Check
-    # =========================================================
+    ## 数据路径健壮性检查，防止训练中途路径报错
     if is_main:
         logger.info("="*20 + " [Sanity Check] Validating Dataset Paths " + "="*20)
         
@@ -1190,17 +1310,12 @@ def main_worker(opts):
             else:
                 logger.info(f"[Check] PASSED: All files in {list_name} exist.")
 
-        # 检查训练集图片
         _validate_file_list("Train Images", opts.data_path)
-        # 检查训练集线框 (PKL)
         _validate_file_list("Train Wireframes", opts.train_wireframes_list)
-        # 检查验证集图片
         _validate_file_list("Val Images", opts.validation_path)
         
-        # 检查 NPZ (如果是 YAML 模式，train_npz_list 是文件路径列表；如果是 CLI 模式，可能是列表文件的路径)
-        # 为了安全起见，这里仅简单检查列表中的第一项是否为有效路径
         if train_npz_list and len(train_npz_list) > 0:
-             # 如果列表第一项是一个存在的 .npz 文件，说明这是一个直接的路径列表，检查前5个即可(避免IO过重)
+             # 如果列表第一项是一个存在的 .npz 文件，说明这是一个直接的路径列表，检查前5个即可
              # 如果列表第一项是一个存在的 .txt 文件，说明这是列表文件
             first_item = train_npz_list[0]
             if os.path.isfile(first_item):
@@ -1212,10 +1327,9 @@ def main_worker(opts):
                         if not os.path.exists(p):
                             raise FileNotFoundError(f"Missing NPZ file: {p}")
                     logger.info(f"[Check] PASSED: Train NPZ sample check.")
-        
         logger.info("="*60)
-    # =========================================================
 
+    ## 建立训练集、验证集
     train_loader, val_dataset, train_sampler, train_base_ds = build_datasets_and_loader(
         opts, logger, train_npz_list=train_npz_list
     )
@@ -1248,7 +1362,10 @@ def main_worker(opts):
             new_train_map, 
             npz_path_list=train_npz_list, 
             logger=logger,
-            no_align=getattr(opts, "no_align", False) # ablation
+            local_used_gt=getattr(opts, "local_used_gt", False), # ablation
+            no_global_ref=getattr(opts, "no_global_ref", False),
+            no_local_ref=getattr(opts, "no_local_ref", False),
+            local_used_last_frame=getattr(opts, "local_used_last_frame", False),
         )
                 # [DDP Fix] Distribute by frame-level "clips" rather than by sequences.
         rank = int(getattr(opts, "rank", 0))
@@ -1283,6 +1400,21 @@ def main_worker(opts):
         )
         rebuild_seq_indices(val_dataset, "Val")
 
+    ## 若开启debug_line，导出可视化线框
+    if is_main and getattr(opts, "debug_line", False):
+        debug_line_dir = getattr(opts, "debug_line_dir", "debug_line")
+        dump_debug_line_panels(
+            train_base_ds,
+            train_base_ds.seq_to_indices,
+            out_dir=debug_line_dir,
+            frames_per_seq=10,
+            logger=logger,
+            local_used_gt=getattr(opts, "local_used_gt", False),
+            no_global_ref=getattr(opts, "no_global_ref", False),
+            no_local_ref=getattr(opts, "no_local_ref", False),
+        )
+
+    ## 若开启check_ref_frame，运行参考帧一致性检查（模型输入线框），且不进入训练
     if getattr(opts, "check_ref_frame", False):
         if is_main:
             logger.info("[CheckRef] --check_ref_frame is enabled. Running reference-frame consistency check only.")
@@ -1299,8 +1431,17 @@ def main_worker(opts):
 
     model = build_model(opts, device, logger)
     if opts.dist:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-        if is_main: logger.info("[DDP] Model wrapped with DistributedDataParallel")
+        # Ablation modes may change active reference branches; enable unused-param detection
+        # to avoid potential DDP hangs when a branch becomes conditionally inactive.
+        ddp_find_unused = bool(getattr(opts, "no_global_ref", False) or getattr(opts, "no_local_ref", False))
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=ddp_find_unused,
+        )
+        if is_main:
+            logger.info(f"[DDP] Model wrapped with DistributedDataParallel (find_unused_parameters={ddp_find_unused})")
     
     optim_kwargs = {'lr': opts.lr, 'betas': (0.9, 0.95), 'weight_decay': 0.0}
     if torch.cuda.is_available() and hasattr(torch.optim, 'Adam') and 'fused' in torch.optim.Adam.__init__.__code__.co_varnames: optim_kwargs['fused'] = True
@@ -1402,8 +1543,13 @@ if __name__ == "__main__":
     parser.add_argument("--dilate1_ep", type=int, default=1, help="Epoch to switch from dilate=3 to dilate=1.")
 
     #消融指标
-    parser.add_argument("--no_align", action="store_true", help="Do not align reference frames (use raw previous) and force IOU to 1.0")
-    parser.add_argument("--check_ref_frame", action="store_true", help="Run reference-frame Chamfer check and exit")
+    parser.add_argument("--local_used_gt", action="store_true", help="Use current-frame GT as local reference without alignment and force IOU to 1.0")
+    parser.add_argument("--no_global_ref", action="store_true", help="Do not use global reference frame; replace with empty tensors")
+    parser.add_argument("--no_local_ref", action="store_true", help="Do not use local reference frame; replace with empty tensors")
+    parser.add_argument("--local_used_last_frame", action="store_true", help="Use previous frame GT as local reference without alignment")
+    parser.add_argument("--debug_line", action="store_true", help="Dump local/global/current line panels for each sequence to local directory")
+    parser.add_argument("--debug_line_dir", type=str, default="debug_line", help="Output directory for --debug_line panels")
+    parser.add_argument("--check_ref_frame", action="store_true", help="Run reference-frame Chamfer check with wireframe/model-input dump and exit")
     parser.add_argument("--check_ref_frame_dir", type=str, default="check_ref_frame", help="Output directory for ref-frame check")
     parser.add_argument("--check_ref_frame_step", type=int, default=1000, help="Save one visualization every N frames")
     parser.add_argument("--check_ref_frame_random_samples", type=int, default=20, help="Additional random visualization count")
