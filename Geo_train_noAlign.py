@@ -24,12 +24,27 @@ from datasets.dataset_TSR import (
 
 
 class MaPDatasetWrapperNoAlign(Dataset):
-    def __init__(self, dataset, seq_to_indices, logger=None, no_global_ref=False, no_local_ref=False):
+    def __init__(
+        self,
+        dataset,
+        seq_to_indices,
+        npz_path_list=None,
+        logger=None,
+        local_used_gt=False,
+        no_global_ref=False,
+        no_local_ref=False,
+        local_used_last_frame=False,
+        **kwargs,
+    ):
         self.dataset = dataset
         self.seq_to_indices = seq_to_indices
         self.logger = logger
         self.no_global_ref = no_global_ref
         self.no_local_ref = no_local_ref
+        # keep signature-compatible with Geo_train.MaPDatasetWrapper
+        self.npz_path_list = npz_path_list
+        self.local_used_gt = local_used_gt
+        self.local_used_last_frame = local_used_last_frame
 
         self.idx_info = {}
         count = 0
