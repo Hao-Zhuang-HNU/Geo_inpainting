@@ -12,10 +12,11 @@ import collections
 
 import torch
 from torch.utils.data import DataLoader, Dataset
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-
 import Geo_train as base
+
+_ORIG_BUILD_DATASETS_AND_LOADER = base.build_datasets_and_loader
+_ORIG_EVALUATE_SEQUENCE = base.evaluate_sequence
+_ORIG_LOAD_CONFIG_TO_OPTS = base.load_config_to_opts
 from datasets.dataset_TSR import (
     ContinuousEdgeLineDatasetMask,
     ContinuousEdgeLineDatasetMaskFinetune,
@@ -169,11 +170,11 @@ def build_datasets_and_loader_noalign(opts, logger, train_npz_list=None):
 @torch.no_grad()
 def evaluate_sequence_noalign(model, val_dataset, seq_to_ref, device, logger, amp, opts, writer=None, epoch=0, val_npz_list=None):
     # Delegate to base evaluator with no-align options forced.
-    return base.evaluate_sequence(model, val_dataset, seq_to_ref, device, logger, amp, opts, writer=writer, epoch=epoch, val_npz_list=None)
+    return _ORIG_EVALUATE_SEQUENCE(model, val_dataset, seq_to_ref, device, logger, amp, opts, writer=writer, epoch=epoch, val_npz_list=None)
 
 
 def load_config_to_opts_noalign(opts):
-    opts = base.load_config_to_opts(opts)
+    opts = _ORIG_LOAD_CONFIG_TO_OPTS(opts)
     # Force no-align behavior
     opts.local_used_gt = False
     opts.local_used_last_frame = True
