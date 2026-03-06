@@ -6,6 +6,7 @@ import sys
 import random
 import time
 import collections
+import contextlib
 import yaml
 
 import torch
@@ -553,7 +554,7 @@ def build_seq_ref_feats(model, dataset, device, opts):
 
 def train_one_epoch_optimized(model, train_loader, dataset_obj, optimizer, device, scaler, logger, epoch, amp, opts, scheduler, writer=None, global_step=0):
     model.train()
-    
+
     if epoch < opts.dilate1_ep:
         current_dilate = 3
     else:
@@ -563,219 +564,201 @@ def train_one_epoch_optimized(model, train_loader, dataset_obj, optimizer, devic
         logger.info(f"[Curriculum] Epoch {epoch}: GT Dilate={current_dilate}")
 
     criterion = EdgeLineLoss(
-        focal_weight=opts.focal_weight, 
+        focal_weight=opts.focal_weight,
         tversky_weight=opts.tversky_weight,
-        alpha=opts.line_tv_alpha, 
+        alpha=opts.line_tv_alpha,
         beta=opts.line_tv_beta
     )
-    
+
     total_loss, total_samples = 0.0, 0
     raw_model = model.module if isinstance(model, DDP) else model
-    
-    for it, batch in enumerate(train_loader):
-        B = batch['c_img'].size(0)
-        
-        c_img = batch['c_img'].to(device, non_blocking=True)
-        c_edge = batch['c_edge'].to(device, non_blocking=True)
-        c_line = batch['c_line'].to(device, non_blocking=True)
-        c_mask = batch['c_mask'].to(device, non_blocking=True)
-        g_edge = batch['g_edge'].to(device, non_blocking=True)
-        g_line = batch['g_line'].to(device, non_blocking=True)
-        l_edge = batch['l_edge'].to(device, non_blocking=True)
-        l_line = batch['l_line'].to(device, non_blocking=True)
-        l_mask = batch['l_mask'].to(device, non_blocking=True)
-        local_conf = batch.get("conf", None)  # [ADD] confidence_iou from npz
-        if local_conf is not None:
-            local_conf = local_conf.to(device=device, non_blocking=True, dtype=torch.float32)
-            #消融：如果启用 no_gate，强制将置信度设为 1.0 (全通)
-            if getattr(opts, "no_gate", False):
-                local_conf = torch.ones_like(local_conf)
 
-        npz_ok = batch.get("npz_ok", None)
-        warp_valid = batch.get("warp_valid", None)
-        local_used = batch.get("local_used", None)
-        is_first = batch.get("is_first", None)
+    ddp_join_ctx = model.join(throw_on_early_termination=False) if isinstance(model, DDP) else contextlib.nullcontext()
+    with ddp_join_ctx:
+        for it, batch in enumerate(train_loader):
+            B = batch['c_img'].size(0)
 
-        if npz_ok is not None: npz_ok = npz_ok.to(device=device, non_blocking=True, dtype=torch.float32)
-        if warp_valid is not None: warp_valid = warp_valid.to(device=device, non_blocking=True, dtype=torch.float32)
-        if local_used is not None: local_used = local_used.to(device=device, non_blocking=True, dtype=torch.float32)
-        if is_first is not None: is_first = is_first.to(device=device, non_blocking=True, dtype=torch.float32)
+            c_img = batch['c_img'].to(device, non_blocking=True)
+            c_edge = batch['c_edge'].to(device, non_blocking=True)
+            c_line = batch['c_line'].to(device, non_blocking=True)
+            c_mask = batch['c_mask'].to(device, non_blocking=True)
+            g_edge = batch['g_edge'].to(device, non_blocking=True)
+            g_line = batch['g_line'].to(device, non_blocking=True)
+            l_edge = batch['l_edge'].to(device, non_blocking=True)
+            l_line = batch['l_line'].to(device, non_blocking=True)
+            l_mask = batch['l_mask'].to(device, non_blocking=True)
+            local_conf = batch.get("conf", None)
+            if local_conf is not None:
+                local_conf = local_conf.to(device=device, non_blocking=True, dtype=torch.float32)
+                if getattr(opts, "no_gate", False):
+                    local_conf = torch.ones_like(local_conf)
 
-        disable_global_ref = bool(getattr(opts, "no_global_ref", False))
-        disable_local_ref = bool(getattr(opts, "no_local_ref", False))
+            npz_ok = batch.get("npz_ok", None)
+            warp_valid = batch.get("warp_valid", None)
+            local_used = batch.get("local_used", None)
+            is_first = batch.get("is_first", None)
 
-        # only diagnose non-first frames (more meaningful)
-        non_first = None
-        if is_first is not None:
-            non_first = (1.0 - is_first).clamp(0, 1)  # [B]
-            denom_nf = non_first.sum().clamp_min(1.0)
-        else:
-            denom_nf = torch.tensor(float(B), device=device)
+            if npz_ok is not None:
+                npz_ok = npz_ok.to(device=device, non_blocking=True, dtype=torch.float32)
+            if warp_valid is not None:
+                warp_valid = warp_valid.to(device=device, non_blocking=True, dtype=torch.float32)
+            if local_used is not None:
+                local_used = local_used.to(device=device, non_blocking=True, dtype=torch.float32)
+            if is_first is not None:
+                is_first = is_first.to(device=device, non_blocking=True, dtype=torch.float32)
 
-        # [修改] 移除了原有的 known 区域掩码计算和 _binary_iou 实时计算代码
-        # 仅依赖从 batch 中读取的 local_conf (即 npz 中的 confidence_iou)
+            disable_global_ref = bool(getattr(opts, "no_global_ref", False))
+            disable_local_ref = bool(getattr(opts, "no_local_ref", False))
 
-        # handle "empty line" cases (optional)
-        empty_gt = (c_line.flatten(1).sum(1) == 0).float()
-        empty_local = (l_line.flatten(1).sum(1) == 0).float()
-
-        # periodic logging (rank0 only)
-        if dist.get_rank() == 0 and ((it % 50) == 0):
-            # ratios (prefer non-first)
-            if non_first is not None:
-                npz_ok_ratio = (npz_ok * non_first).sum() / denom_nf if npz_ok is not None else torch.tensor(0.0, device=device)
-                warp_valid_ratio = (warp_valid * non_first).sum() / denom_nf if warp_valid is not None else torch.tensor(0.0, device=device)
-                local_used_ratio = (local_used * non_first).sum() / denom_nf if local_used is not None else torch.tensor(0.0, device=device)
-
-                conf_nf = (local_conf * non_first) if local_conf is not None else None
-                conf_mean = conf_nf.sum() / denom_nf if conf_nf is not None else torch.tensor(0.0, device=device)
+            non_first = None
+            if is_first is not None:
+                non_first = (1.0 - is_first).clamp(0, 1)
+                denom_nf = non_first.sum().clamp_min(1.0)
             else:
-                npz_ok_ratio = npz_ok.mean() if npz_ok is not None else torch.tensor(0.0, device=device)
-                warp_valid_ratio = warp_valid.mean() if warp_valid is not None else torch.tensor(0.0, device=device)
-                local_used_ratio = local_used.mean() if local_used is not None else torch.tensor(0.0, device=device)
-                conf_mean = local_conf.mean() if local_conf is not None else torch.tensor(0.0, device=device)
+                denom_nf = torch.tensor(float(B), device=device)
 
-            conf_min = local_conf.min() if local_conf is not None else torch.tensor(0.0, device=device)
-            conf_max = local_conf.max() if local_conf is not None else torch.tensor(0.0, device=device)
+            empty_gt = (c_line.flatten(1).sum(1) == 0).float()
+            empty_local = (l_line.flatten(1).sum(1) == 0).float()
 
-            # [修改] 日志字符串中移除了 iou_known 和 iou_all
-            logger.info(
-                f"[Diag][Ep{epoch} It{it}] "
-                f"npz_ok={npz_ok_ratio.item():.3f} warp_valid={warp_valid_ratio.item():.3f} local_used={local_used_ratio.item():.3f} | "
-                f"conf(mean/min/max)={conf_mean.item():.3f}/{conf_min.item():.3f}/{conf_max.item():.3f} | "
-                f"empty_gt={float(empty_gt.mean().item()):.3f} empty_local={float(empty_local.mean().item()):.3f}"
-            )
+            if dist.get_rank() == 0 and ((it % 50) == 0):
+                if non_first is not None:
+                    npz_ok_ratio = (npz_ok * non_first).sum() / denom_nf if npz_ok is not None else torch.tensor(0.0, device=device)
+                    warp_valid_ratio = (warp_valid * non_first).sum() / denom_nf if warp_valid is not None else torch.tensor(0.0, device=device)
+                    local_used_ratio = (local_used * non_first).sum() / denom_nf if local_used is not None else torch.tensor(0.0, device=device)
 
-            if writer is not None:
-                step = global_step + it
-                writer.add_scalar("diag/npz_ok_ratio", float(npz_ok_ratio.item()), step)
-                writer.add_scalar("diag/warp_valid_ratio", float(warp_valid_ratio.item()), step)
-                writer.add_scalar("diag/local_used_ratio", float(local_used_ratio.item()), step)
-                writer.add_scalar("diag/conf_mean", float(conf_mean.item()), step)
-                writer.add_scalar("diag/conf_min", float(conf_min.item()), step)
-                writer.add_scalar("diag/conf_max", float(conf_max.item()), step)
-                # [修改] 移除了 diag/iou_known_mean 和 diag/iou_all_mean 的 TensorBoard 写入
-            
-        for t in [c_mask, c_edge, c_line, l_mask, l_edge, l_line, g_edge, g_line]:
-            if t.dim() == 3: t.unsqueeze_(1)
+                    conf_nf = (local_conf * non_first) if local_conf is not None else None
+                    conf_mean = conf_nf.sum() / denom_nf if conf_nf is not None else torch.tensor(0.0, device=device)
+                else:
+                    npz_ok_ratio = npz_ok.mean() if npz_ok is not None else torch.tensor(0.0, device=device)
+                    warp_valid_ratio = warp_valid.mean() if warp_valid is not None else torch.tensor(0.0, device=device)
+                    local_used_ratio = local_used.mean() if local_used is not None else torch.tensor(0.0, device=device)
+                    conf_mean = local_conf.mean() if local_conf is not None else torch.tensor(0.0, device=device)
 
-        optimizer.zero_grad(set_to_none=True)
+                conf_min = local_conf.min() if local_conf is not None else torch.tensor(0.0, device=device)
+                conf_max = local_conf.max() if local_conf is not None else torch.tensor(0.0, device=device)
 
-        with torch.amp.autocast('cuda', enabled=amp, dtype=torch.bfloat16):
-            # Use same-resolution blank images instead of None for reference-image inputs.
-            # This keeps tensor-shaped inputs stable in ablation/non-ablation modes.
-            g_img_in = torch.zeros_like(c_img)
-            g_edge_in = torch.zeros_like(g_edge) if disable_global_ref else g_edge
-            g_line_in = torch.zeros_like(g_line) if disable_global_ref else g_line
-            l_img_in = torch.zeros_like(c_img)
-            l_edge_in = torch.zeros_like(l_edge) if disable_local_ref else l_edge
-            l_line_in = torch.zeros_like(l_line) if disable_local_ref else l_line
-            l_mask_in = torch.ones_like(l_mask) if disable_local_ref else l_mask
+                logger.info(
+                    f"[Diag][Ep{epoch} It{it}] "
+                    f"npz_ok={npz_ok_ratio.item():.3f} warp_valid={warp_valid_ratio.item():.3f} local_used={local_used_ratio.item():.3f} | "
+                    f"conf(mean/min/max)={conf_mean.item():.3f}/{conf_min.item():.3f}/{conf_max.item():.3f} | "
+                    f"empty_gt={float(empty_gt.mean().item()):.3f} empty_local={float(empty_local.mean().item()):.3f}"
+                )
 
-            ref_feat = raw_model.extract_reference_features(
-                global_img=g_img_in, global_edge=g_edge_in, global_line=g_line_in,
-                local_img=l_img_in, local_edge=l_edge_in, local_line=l_line_in, local_mask=l_mask_in,
-            )
-            
-            edge_logits, line_logits = raw_model.forward_with_logits(
-                img_idx=c_img, edge_idx=c_edge, line_idx=c_line, masks=c_mask, ref_feat=ref_feat
-            )
-            
-            target_edge = dilate_tensor(c_edge, kernel_size=current_dilate)
-            target_line = dilate_tensor(c_line, kernel_size=current_dilate)
-            
-            loss_line = criterion(line_logits, target_line)
-            
-            if opts.disable_edge:
-                loss = loss_line
-            else:
-                loss_edge = criterion(edge_logits, target_edge)
-                loss = (loss_edge + loss_line)
-        
-        if torch.isnan(loss) or torch.isinf(loss):
-            # 将 loss 抹零，使其产生 全0梯度，参与 DDP 同步
-            loss = loss * 0.0 
-        loss.backward()
-        
-        if check_grads_finite(model):
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-        
-        total_loss += loss.item() * B
-        total_samples += B
-        
-        if opts.tb_images and writer is not None and dist.get_rank() == 0:
-            should_log = (it % 100 == 0)
-            if should_log:
-                try:
-                    curr_orig_idx = batch['orig_idx'][0].item()
-                    seq_id_val = train_wrapper.idx_to_seq.get(curr_orig_idx, "unknown")
-                    seq_name = str(seq_id_val)[:10]
-                except:
-                    seq_name = "unknown"
-
-                with torch.no_grad():
-                    sample_idx = 0
+                if writer is not None:
                     step = global_step + it
+                    writer.add_scalar("diag/npz_ok_ratio", float(npz_ok_ratio.item()), step)
+                    writer.add_scalar("diag/warp_valid_ratio", float(warp_valid_ratio.item()), step)
+                    writer.add_scalar("diag/local_used_ratio", float(local_used_ratio.item()), step)
+                    writer.add_scalar("diag/conf_mean", float(conf_mean.item()), step)
+                    writer.add_scalar("diag/conf_min", float(conf_min.item()), step)
+                    writer.add_scalar("diag/conf_max", float(conf_max.item()), step)
 
-                    # 1. Input image - 使用clone避免引用原tensor
-                    img_vis = (c_img[sample_idx].clone() * 0.5 + 0.5).clamp(0, 1)
-                    writer.add_image(f"train/{seq_name}/1_input", img_vis.cpu(), step)
-                    del img_vis  # 立即删除
+            for t in [c_mask, c_edge, c_line, l_mask, l_edge, l_line, g_edge, g_line]:
+                if t.dim() == 3:
+                    t.unsqueeze_(1)
 
-                    # 2. Overlay line - 使用clone并立即转CPU
-                    line_pred = torch.sigmoid(line_logits[sample_idx:sample_idx+1].clone()).clamp(0, 1)
-                    line_gt = c_line[sample_idx:sample_idx+1].clone()
-                    local_warp_line = l_line[sample_idx:sample_idx+1].clone().clamp(0, 1)
+            optimizer.zero_grad(set_to_none=True)
 
-                    alpha_blue = 0.3
-                    blue_chan = (local_warp_line[0] * alpha_blue).clamp(0, 1)
+            with torch.amp.autocast('cuda', enabled=amp, dtype=torch.bfloat16):
+                g_img_in = torch.zeros_like(c_img)
+                g_edge_in = torch.zeros_like(g_edge) if disable_global_ref else g_edge
+                g_line_in = torch.zeros_like(g_line) if disable_global_ref else g_line
+                l_img_in = torch.zeros_like(c_img)
+                l_edge_in = torch.zeros_like(l_edge) if disable_local_ref else l_edge
+                l_line_in = torch.zeros_like(l_line) if disable_local_ref else l_line
+                l_mask_in = torch.ones_like(l_mask) if disable_local_ref else l_mask
 
-                    line_overlay = torch.cat([line_gt[0], line_pred[0], blue_chan], dim=0)
-                    writer.add_image(f"train/{seq_name}/2_overlay_line", line_overlay.cpu(), step)
+                ref_feat = raw_model.extract_reference_features(
+                    global_img=g_img_in, global_edge=g_edge_in, global_line=g_line_in,
+                    local_img=l_img_in, local_edge=l_edge_in, local_line=l_line_in, local_mask=l_mask_in,
+                )
 
-                    # 立即删除所有中间变量
-                    del line_pred, line_gt, local_warp_line, blue_chan, line_overlay
+                edge_logits, line_logits = raw_model.forward_with_logits(
+                    img_idx=c_img, edge_idx=c_edge, line_idx=c_line, masks=c_mask, ref_feat=ref_feat
+                )
 
-                    # 3. Local reference line
-                    l_line_vis = l_line[sample_idx].clone().clamp(0, 1)
-                    writer.add_image(f"train/{seq_name}/3_local_ref_line", l_line_vis.cpu(), step)
-                    del l_line_vis
+                target_edge = dilate_tensor(c_edge, kernel_size=current_dilate)
+                target_line = dilate_tensor(c_line, kernel_size=current_dilate)
 
-                    # 4. Predicted line
-                    pred_vis = torch.sigmoid(line_logits[sample_idx:sample_idx+1].clone()).clamp(0, 1)
-                    writer.add_image(f"train/{seq_name}/4_pred_line", pred_vis[0].cpu(), step)
-                    del pred_vis
+                loss_line = criterion(line_logits, target_line)
 
-                    # 5. Global reference line
-                    g_line_vis = g_edge[sample_idx].clone().clamp(0, 1)
-                    writer.add_image(f"train/{seq_name}/5_global_ref_line", g_line_vis.cpu(), step)
-                    del g_line_vis
+                if opts.disable_edge:
+                    loss = loss_line
+                else:
+                    loss_edge = criterion(edge_logits, target_edge)
+                    loss = (loss_edge + loss_line)
 
-                    # 强制清理显存
-                    torch.cuda.empty_cache()
-        current_loss_val = loss.item()  
-        del loss, edge_logits, line_logits, ref_feat
-        del c_img, c_edge, c_line, c_mask
-        del g_edge, g_line
-        del l_edge, l_line, l_mask
-        
-        # 清理batch中的其他tensor
-        if local_conf is not None:
-            del local_conf
-        if npz_ok is not None:
-            del npz_ok, warp_valid, local_used, is_first
-        
-        # 每50个iteration强制清理一次
-        if (it + 1) % 50 == 0 and dist.get_rank() == 0:
-            logger.info(f"[SeqTrain] Ep {epoch} It {it+1}/{len(train_loader)} Loss {current_loss_val:.4f}")
-            torch.cuda.empty_cache()
+            if torch.isnan(loss) or torch.isinf(loss):
+                loss = loss * 0.0
+            loss.backward()
+
+            if check_grads_finite(model):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+
+            total_loss += loss.item() * B
+            total_samples += B
+
+            if opts.tb_images and writer is not None and dist.get_rank() == 0:
+                should_log = (it % 100 == 0)
+                if should_log:
+                    try:
+                        curr_orig_idx = batch['orig_idx'][0].item()
+                        seq_id_val = train_wrapper.idx_to_seq.get(curr_orig_idx, "unknown")
+                        seq_name = str(seq_id_val)[:10]
+                    except:
+                        seq_name = "unknown"
+
+                    with torch.no_grad():
+                        sample_idx = 0
+                        step = global_step + it
+                        img_vis = (c_img[sample_idx].clone() * 0.5 + 0.5).clamp(0, 1)
+                        writer.add_image(f"train/{seq_name}/1_input", img_vis.cpu(), step)
+                        del img_vis
+
+                        line_pred = torch.sigmoid(line_logits[sample_idx:sample_idx+1].clone()).clamp(0, 1)
+                        line_gt = c_line[sample_idx:sample_idx+1].clone()
+                        local_warp_line = l_line[sample_idx:sample_idx+1].clone().clamp(0, 1)
+
+                        alpha_blue = 0.3
+                        blue_chan = (local_warp_line[0] * alpha_blue).clamp(0, 1)
+                        line_overlay = torch.cat([line_gt[0], line_pred[0], blue_chan], dim=0)
+                        writer.add_image(f"train/{seq_name}/2_overlay_line", line_overlay.cpu(), step)
+                        del line_pred, line_gt, local_warp_line, blue_chan, line_overlay
+
+                        l_line_vis = l_line[sample_idx].clone().clamp(0, 1)
+                        writer.add_image(f"train/{seq_name}/3_local_ref_line", l_line_vis.cpu(), step)
+                        del l_line_vis
+
+                        pred_vis = torch.sigmoid(line_logits[sample_idx:sample_idx+1].clone()).clamp(0, 1)
+                        writer.add_image(f"train/{seq_name}/4_pred_line", pred_vis[0].cpu(), step)
+                        del pred_vis
+
+                        g_line_vis = g_edge[sample_idx].clone().clamp(0, 1)
+                        writer.add_image(f"train/{seq_name}/5_global_ref_line", g_line_vis.cpu(), step)
+                        del g_line_vis
+
+                        torch.cuda.empty_cache()
+            current_loss_val = loss.item()
+            del loss, edge_logits, line_logits, ref_feat
+            del c_img, c_edge, c_line, c_mask
+            del g_edge, g_line
+            del l_edge, l_line, l_mask
+
+            if local_conf is not None:
+                del local_conf
+            if npz_ok is not None:
+                del npz_ok, warp_valid, local_used, is_first
+
+            if (it + 1) % 50 == 0 and dist.get_rank() == 0:
+                logger.info(f"[SeqTrain] Ep {epoch} It {it+1}/{len(train_loader)} Loss {current_loss_val:.4f}")
+                torch.cuda.empty_cache()
 
     total_loss_tensor = torch.tensor(total_loss, device=device)
     total_samples_tensor = torch.tensor(total_samples, device=device)
     dist.all_reduce(total_loss_tensor, op=dist.ReduceOp.SUM)
     dist.all_reduce(total_samples_tensor, op=dist.ReduceOp.SUM)
-    
+
     return total_loss_tensor.item() / max(1, total_samples_tensor.item()), global_step + len(train_loader)
 
 def prepare_fixed_validation_set(opts, val_dataset, logger):
