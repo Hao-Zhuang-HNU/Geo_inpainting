@@ -292,7 +292,8 @@ class ContinuousEdgeLineDatasetMask(Dataset):
 
         # 3) 载入 pkl（兼容 numpy 反序列化差异）
         def _load_pickle_compat(path):
-            data = open(path, 'rb').read()
+            with open(path, 'rb') as f:
+                data = f.read()
             class NPCompatUnpickler(pkl.Unpickler):
                 def find_class(self, module, name):
                     if module.startswith('numpy._core'):
