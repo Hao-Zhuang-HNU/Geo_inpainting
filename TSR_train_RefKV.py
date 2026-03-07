@@ -772,33 +772,38 @@ def evaluate_sequence(model, val_dataset, seq_to_ref, device, logger, amp, opts,
         prev_line = g_line
         
         for i, target_idx in enumerate(sorted_idxs):
-            if i == 0: continue
-            
             meta_tgt = val_dataset[target_idx]
             t_img = _ensure_4d_float(meta_tgt["img"], device)
             t_edge_gt = _ensure_4d_float(meta_tgt["edge"], device)
             t_line_gt = _ensure_4d_float(meta_tgt["line"], device)
             t_mask = _ensure_4d_float(meta_tgt["mask"], device)
             if t_mask.dim() == 3: t_mask = t_mask.unsqueeze(1)
-            
-            warp_valid = False
-            H_mat = np.eye(3)
-            if val_npz_list is not None:
-                try:
-                    wd = np.load(val_npz_list[target_idx])
-                    if bool(wd['valid']):
-                        H_mat = wd['homography']
-                        warp_valid = True
-                except: pass
-            
-            if warp_valid:
-                l_edge = warp_tensor(prev_edge, H_mat)
-                l_line = warp_tensor(prev_line, H_mat)
-                l_mask = torch.zeros_like(t_mask) 
+
+            if i == 0:
+                # 第一帧没有可用的前序预测，直接用参考帧监督，避免整段序列长度为1时 val_frames=0
+                l_edge = g_edge
+                l_line = g_line
+                l_mask = torch.zeros_like(t_mask)
             else:
-                l_edge = torch.zeros_like(t_edge_gt)
-                l_line = torch.zeros_like(t_line_gt)
-                l_mask = torch.ones_like(t_mask)
+                warp_valid = False
+                H_mat = np.eye(3)
+                if val_npz_list is not None:
+                    try:
+                        wd = np.load(val_npz_list[target_idx])
+                        if bool(wd['valid']):
+                            H_mat = wd['homography']
+                            warp_valid = True
+                    except:
+                        pass
+
+                if warp_valid:
+                    l_edge = warp_tensor(prev_edge, H_mat)
+                    l_line = warp_tensor(prev_line, H_mat)
+                    l_mask = torch.zeros_like(t_mask)
+                else:
+                    l_edge = torch.zeros_like(t_edge_gt)
+                    l_line = torch.zeros_like(t_line_gt)
+                    l_mask = torch.ones_like(t_mask)
 
             if opts.ref_dilate > 1:
                 l_edge = dilate_tensor(l_edge, opts.ref_dilate)
