@@ -75,10 +75,36 @@ def _normalize_path_from_cfg(path_value, config_path):
     p = str(path_value).strip().strip('"').strip("'")
     if not p:
         return p
+    p = os.path.expanduser(os.path.expandvars(p))
     if os.path.isabs(p):
-        return p
+        return os.path.normpath(p)
     base_dir = os.path.dirname(os.path.abspath(config_path)) if config_path else os.getcwd()
     return os.path.normpath(os.path.join(base_dir, p))
+
+
+def _resolve_existing_path(path_value, config_path):
+    """Resolve a path and prefer an existing file if possible."""
+    raw = str(path_value).strip().strip('"').strip("'")
+    if not raw:
+        return raw
+
+    # Candidate 1: normalized relative to config directory.
+    c1 = _normalize_path_from_cfg(raw, config_path)
+    if os.path.exists(c1):
+        return c1
+
+    # Candidate 2: relative to current working directory (repo launch dir).
+    c2 = os.path.normpath(os.path.expanduser(os.path.expandvars(raw)))
+    if os.path.isabs(c2):
+        if os.path.exists(c2):
+            return c2
+    else:
+        c2_abs = os.path.normpath(os.path.join(os.getcwd(), c2))
+        if os.path.exists(c2_abs):
+            return c2_abs
+
+    # Candidate 3: keep config-relative normalized path as fallback.
+    return c1
 
 
 def _fallback_pick_from_keys(cfg, keys_any, keys_endswith):
@@ -112,9 +138,9 @@ def _apply_yaml_overrides(opts):
             opts.n_head = int(v)
 
     if not opts.pretrain_ckpt:
-        v = _pick_first(cfg, ["model.pretrain_ckpt", "model_settings.pretrain_ckpt", "manual_validate.pretrain_ckpt"])
+        v = _pick_first(cfg, ["model.pretrain_ckpt", "model_settings.pretrain_ckpt", "manual_validate.pretrain_ckpt", "manual_config.pretrain_ckpt", "pretrain_ckpt", "training_params.pretrain_ckpt"])
         if v is not None:
-            opts.pretrain_ckpt = _normalize_path_from_cfg(v, opts.config_path)
+            opts.pretrain_ckpt = _resolve_existing_path(v, opts.config_path)
 
     if not opts.validation_path:
         v = _pick_first(cfg, [
@@ -293,6 +319,10 @@ def main():
     opts = _build_parser().parse_args()
     opts = _apply_yaml_overrides(opts)
     _ensure_ready(opts)
+
+    if opts.pretrain_ckpt and not os.path.isfile(opts.pretrain_ckpt):
+        print(f"[WARN] pretrain_ckpt does not exist: {opts.pretrain_ckpt}")
+        print("[WARN] Model will run with scratch weights. Please check --pretrain_ckpt or config key.")
 
     device = torch.device(opts.device if (opts.device == "cpu" or torch.cuda.is_available()) else "cpu")
 
