@@ -1,0 +1,4 @@
+pretrain_ckpt: "ckpt/Geo_noAlign/latest.pth"
+validation_path: "filter_results/DL3DV10K_filtered_val/train_imgs_clean.txt"
+valid_mask_path: "/root/autodl-tmp/Inpainting/SfM_inpainting/data_list/irregular_mask_30_40.txt"
+val_wireframes_list: "filter_results/DL3DV10K_filtered_val/train_pkls_clean.txt"
