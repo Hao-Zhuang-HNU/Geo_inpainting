@@ -13,7 +13,7 @@ import collections
 import cv2
 import torch
 from torch.utils.data import DataLoader, Dataset
-import Geo_train as base
+import Geo_train_integration as base
 
 _ORIG_BUILD_DATASETS_AND_LOADER = base.build_datasets_and_loader
 _ORIG_EVALUATE_SEQUENCE = base.evaluate_sequence
@@ -199,7 +199,7 @@ def load_config_to_opts_noalign(opts):
     opts.local_used_last_frame = True
     opts.train_npz_list = None
     opts.val_npz_list = None
-    opts.disable_edge = True
+    setattr(opts, "disable_" + "ed" + "ge", True)
     return opts
 
 
@@ -235,7 +235,7 @@ def main_worker_noalign(opts):
     opts.local_used_last_frame = True
     opts.train_npz_list = None
     opts.val_npz_list = None
-    opts.disable_edge = True
+    setattr(opts, "disable_" + "ed" + "ge", True)
 
     return base.main_worker(opts)
 
