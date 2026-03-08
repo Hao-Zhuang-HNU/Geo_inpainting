@@ -199,6 +199,7 @@ def load_config_to_opts_noalign(opts):
     opts.local_used_last_frame = True
     opts.train_npz_list = None
     opts.val_npz_list = None
+    opts.disable_edge = True
     return opts
 
 
@@ -234,6 +235,7 @@ def main_worker_noalign(opts):
     opts.local_used_last_frame = True
     opts.train_npz_list = None
     opts.val_npz_list = None
+    opts.disable_edge = True
 
     return base.main_worker(opts)
 

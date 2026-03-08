@@ -439,6 +439,7 @@ class ContinuousLineDatasetMask(Dataset):
             'mask': mask_t,
             'erode_mask': erode,
             'line': line_t,
+            'edge': line_t,
             'name': selected_basename,           # 仅文件名（无后缀），与第三维保持一致
             'img_path': img_path,                # 图片实际路径
             'mask_path': mask_path,
@@ -553,6 +554,7 @@ class ContinuousLineDatasetMaskFinetune(ContinuousLineDatasetMask):
             'mask': mask_t,
             'erode_mask': erode_t,
             'line': line_t,
+            'edge': line_t,
             'name': selected_basename,          # 与 wireframe basename 一致
             'img_path': selected_img_path,      # 真实图像路径
             'mask_path': mask_path_dbg,         # 真实 mask 路径（便于日志）
