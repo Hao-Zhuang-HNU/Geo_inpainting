@@ -56,8 +56,8 @@ os.environ.setdefault("NCCL_IB_DISABLE", "0")
 os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
 
 from datasets.dataset_Geo import (
-    ContinuousEdgeLineDatasetMask,
-    ContinuousEdgeLineDatasetMaskFinetune,
+    ContinuousLineDatasetMask as ContinuousEdgeLineDatasetMask,
+    ContinuousLineDatasetMaskFinetune as ContinuousEdgeLineDatasetMaskFinetune,
 )
 from src.models.Geo_model import EdgeLineGPT256RelBCE, EdgeLineGPTConfig
 from src.utils_RefKV import set_seed

@@ -263,19 +263,40 @@ class EdgeLineGPT256RelBCE(nn.Module):
         line = self.line_decoder(x)
         return line
 
-    def forward_with_logits(self, img_idx, line_idx, masks=None, ref_feat=None):
+    def _forward_line_logits(self, img_idx, line_idx, masks=None, ref_feat=None):
         x = self._encode(img_idx, line_idx, masks)
         x = self._process_blocks(x, ref_feat=ref_feat)
         line = self._decode(x)
         return line
 
+    def forward_with_logits(self, img_idx, line_idx=None, masks=None, ref_feat=None, edge_idx=None, **kwargs):
+        """Backward-compatible logits API.
+
+        Legacy callsites may pass edge_idx and unpack (edge_logits, line_logits).
+        This line-only model maps edge branch inputs/outputs to line tensors.
+        """
+        if line_idx is None:
+            line_idx = edge_idx
+        if line_idx is None:
+            raise ValueError("line_idx is required (or provide edge_idx for legacy compatibility).")
+
+        line = self._forward_line_logits(img_idx, line_idx, masks=masks, ref_feat=ref_feat)
+        return line, line
+
     def extract_reference_features(self, 
                                    global_img=None, global_line=None,
-                                   local_img=None, local_line=None, local_mask=None):
+                                   local_img=None, local_line=None, local_mask=None,
+                                   global_edge=None, local_edge=None, **kwargs):
         """
         Build reference features for global + local references.
         """
         ref_list = []
+
+        # Legacy compatibility: when callers provide edge refs, reuse them as line refs.
+        if global_line is None:
+            global_line = global_edge
+        if local_line is None:
+            local_line = local_edge
 
         # --- 1. Global Ref (Pool 16x16) ---
         if global_img is not None:
@@ -312,7 +333,7 @@ class EdgeLineGPT256RelBCE(nn.Module):
 
 
     def forward(self, img_idx, line_idx, line_targets=None, masks=None, ref_feat=None):
-        line = self.forward_with_logits(img_idx, line_idx, masks, ref_feat)
+        line = self._forward_line_logits(img_idx, line_idx, masks, ref_feat)
         loss = 0
         if line_targets is not None:
             loss = F.binary_cross_entropy_with_logits(line.permute(0, 2, 3, 1).contiguous().view(-1, 1),
