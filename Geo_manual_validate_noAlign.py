@@ -58,6 +58,38 @@ def _pick_first(cfg, paths):
     return None
 
 
+
+
+def _flatten_dict(cfg, prefix=""):
+    out = {}
+    if isinstance(cfg, dict):
+        for k, v in cfg.items():
+            nk = f"{prefix}.{k}" if prefix else str(k)
+            out[nk] = v
+            if isinstance(v, dict):
+                out.update(_flatten_dict(v, nk))
+    return out
+
+
+def _normalize_path_from_cfg(path_value, config_path):
+    p = str(path_value).strip().strip('"').strip("'")
+    if not p:
+        return p
+    if os.path.isabs(p):
+        return p
+    base_dir = os.path.dirname(os.path.abspath(config_path)) if config_path else os.getcwd()
+    return os.path.normpath(os.path.join(base_dir, p))
+
+
+def _fallback_pick_from_keys(cfg, keys_any, keys_endswith):
+    flat = _flatten_dict(cfg)
+    for k, v in flat.items():
+        if v in (None, ""):
+            continue
+        lk = k.lower()
+        if any(token in lk for token in keys_any) or any(lk.endswith(suf) for suf in keys_endswith):
+            return v
+    return None
 def _apply_yaml_overrides(opts):
     if not opts.config_path or not os.path.exists(opts.config_path):
         return opts
@@ -82,27 +114,47 @@ def _apply_yaml_overrides(opts):
     if not opts.pretrain_ckpt:
         v = _pick_first(cfg, ["model.pretrain_ckpt", "model_settings.pretrain_ckpt", "manual_validate.pretrain_ckpt"])
         if v is not None:
-            opts.pretrain_ckpt = str(v)
+            opts.pretrain_ckpt = _normalize_path_from_cfg(v, opts.config_path)
 
     if not opts.validation_path:
         v = _pick_first(cfg, [
             "datasets.validation_path",
             "manual_validate.validation_path",
             "manual_validate.val_imgs_list",
+            "manual_config.validation_path",
+            "manual_config.val_imgs_list",
             "dataset1.val_imgs_list",
+            "val_imgs_list",
+            "validation_path",
         ])
+        if v is None:
+            v = _fallback_pick_from_keys(
+                cfg,
+                keys_any=["val_img", "validation_img", "validation_path", "val_images"],
+                keys_endswith=["val_imgs_list", "validation_path"],
+            )
         if v is not None:
-            opts.validation_path = str(v)
+            opts.validation_path = _normalize_path_from_cfg(v, opts.config_path)
 
     if not opts.val_wireframes_list:
         v = _pick_first(cfg, [
             "datasets.val_wireframes_list",
             "manual_validate.val_wireframes_list",
             "manual_validate.val_pkls_list",
+            "manual_config.val_wireframes_list",
+            "manual_config.val_pkls_list",
             "dataset1.val_pkls_list",
+            "val_pkls_list",
+            "val_wireframes_list",
         ])
+        if v is None:
+            v = _fallback_pick_from_keys(
+                cfg,
+                keys_any=["val_pkl", "wireframe", "line_list", "val_line"],
+                keys_endswith=["val_pkls_list", "val_wireframes_list", "wireframes_list"],
+            )
         if v is not None:
-            opts.val_wireframes_list = str(v)
+            opts.val_wireframes_list = _normalize_path_from_cfg(v, opts.config_path)
 
     if not opts.valid_mask_path:
         v = _pick_first(cfg, [
@@ -110,9 +162,19 @@ def _apply_yaml_overrides(opts):
             "masks.val_mask_list",
             "manual_validate.valid_mask_path",
             "manual_validate.val_mask_list",
+            "manual_config.valid_mask_path",
+            "manual_config.val_mask_list",
+            "valid_mask_path",
+            "val_mask_list",
         ])
+        if v is None:
+            v = _fallback_pick_from_keys(
+                cfg,
+                keys_any=["val_mask", "valid_mask"],
+                keys_endswith=["val_mask_list", "valid_mask_path"],
+            )
         if v is not None:
-            opts.valid_mask_path = str(v)
+            opts.valid_mask_path = _normalize_path_from_cfg(v, opts.config_path)
 
     if opts.mask_rates == [0.4, 0.8, 1.0]:
         v = _pick_first(cfg, ["datasets.mask_rates", "manual_validate.mask_rates"])
@@ -152,7 +214,7 @@ def _apply_yaml_overrides(opts):
     if opts.output == "manual_val_tb_collage.jpg":
         v = _pick_first(cfg, ["manual_validate.output"])
         if v is not None:
-            opts.output = str(v)
+            opts.output = _normalize_path_from_cfg(v, opts.config_path)
 
     return opts
 
