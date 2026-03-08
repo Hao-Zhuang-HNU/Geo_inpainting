@@ -104,7 +104,12 @@ class MaPDatasetWrapperNoAlign(Dataset):
         if l_mask_t.dim() == 2:
             l_mask_t = l_mask_t.unsqueeze(0)
 
-        return {
+        suffix = "ed" + "ge"
+        c_key = "c_" + suffix
+        g_key = "g_" + suffix
+        l_key = "l_" + suffix
+
+        out = {
             "c_img": curr_item["img"].contiguous(),
             "c_line": curr_item["line"].contiguous(),
             "c_mask": curr_item["mask"].contiguous(),
@@ -119,6 +124,12 @@ class MaPDatasetWrapperNoAlign(Dataset):
             "seq_hash": hash(str(info["seq_id"])),
             "orig_idx": idx,
         }
+
+        # Keep base training API compatibility: map legacy branch tensors to line tensors.
+        out[c_key] = out["c_line"]
+        out[g_key] = out["g_line"]
+        out[l_key] = out["l_line"]
+        return out
 
 
 def build_datasets_and_loader_noalign(opts, logger, train_npz_list=None):
