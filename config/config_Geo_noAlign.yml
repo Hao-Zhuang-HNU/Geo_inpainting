@@ -31,8 +31,8 @@ dataset1:
   enable: True
   name: "DL3DV"
   ratio: 1
-  train_imgs_list: "data_list/DL3DV10K_imgs_train.txt"
-  train_pkls_list: "data_list/DL3DV10K_pkls_train.txt"
+  train_imgs_list: "filter_results/DL3DV10K_filtered_line40/train_imgs_clean.txt"
+  train_pkls_list: "filter_results/DL3DV10K_filtered_line40/train_pkls_clean.txt"
 
   val_imgs_list: "filter_results/DL3DV10K_filtered_val/train_imgs_clean.txt"
   val_pkls_list: "filter_results/DL3DV10K_filtered_val/train_pkls_clean.txt"
@@ -44,8 +44,8 @@ dataset2:
   enable: True
   name: "ScannetPP"
   ratio: 1
-  train_imgs_list: "data_list/ScannetPP_imgs_train.txt"
-  train_pkls_list: "data_list/ScannetPP_pkls_train.txt"
+  train_imgs_list: "filter_results/ScannetPP_train_line40/train_imgs_clean.txt"
+  train_pkls_list: "filter_results/ScannetPP_train_line40/train_imgs_clean.txt"
 
   val_imgs_list: ""
   val_pkls_list: ""
