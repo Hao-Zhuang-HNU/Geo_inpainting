@@ -12,7 +12,6 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Dataset Filtering by Line Count")
     parser.add_argument('--img_list', type=str, required=True, help='Original image list')
     parser.add_argument('--pkl_list', type=str, required=True, help='Original pkl list')
-    parser.add_argument('--npz_list', type=str, required=True, help='Original npz list')
     parser.add_argument('-o', '--output_dir', type=str, required=True, help='Directory to save new lists and reject logs')
 
     parser.add_argument('--line_th', type=float, default=40.0, help='Threshold for sequence mean line count')
@@ -114,10 +113,7 @@ def main():
         imgs = [l.strip() for l in f.readlines()]
     with open(args.pkl_list) as f:
         pkls = [l.strip() for l in f.readlines()]
-    with open(args.npz_list) as f:
-        npzs = [l.strip() for l in f.readlines()]
-
-    if not (len(imgs) == len(pkls) == len(npzs)):
+    if not (len(imgs) == len(pkls)):
         print("Error: List lengths do not match!")
         return
 
@@ -180,15 +176,11 @@ def main():
 
     out_img = os.path.join(args.output_dir, "train_imgs_clean.txt")
     out_pkl = os.path.join(args.output_dir, "train_pkls_clean.txt")
-    out_npz = os.path.join(args.output_dir, "train_npzs_clean.txt")
-
     print("Writing clean lists...")
     with open(out_img, 'w') as f:
         f.write('\n'.join([imgs[i] for i in keep_indices]))
     with open(out_pkl, 'w') as f:
         f.write('\n'.join([pkls[i] for i in keep_indices]))
-    with open(out_npz, 'w') as f:
-        f.write('\n'.join([npzs[i] for i in keep_indices]))
 
     total_seqs = len(seq_map)
     kept_seqs = total_seqs - len(rejected_sequences)
