@@ -18,8 +18,8 @@ _ORIG_BUILD_DATASETS_AND_LOADER = base.build_datasets_and_loader
 _ORIG_EVALUATE_SEQUENCE = base.evaluate_sequence
 _ORIG_LOAD_CONFIG_TO_OPTS = base.load_config_to_opts
 from datasets.dataset_Geo import (
-    ContinuousEdgeLineDatasetMask,
-    ContinuousEdgeLineDatasetMaskFinetune,
+    ContinuousLineDatasetMask,
+    ContinuousLineDatasetMaskFinetune,
 )
 
 
@@ -125,7 +125,7 @@ def build_datasets_and_loader_noalign(opts, logger, train_npz_list=None):
     if not opts.MaP:
         raise ValueError("Only MaP mode is supported.")
 
-    base_dataset = ContinuousEdgeLineDatasetMask(
+    base_dataset = ContinuousLineDatasetMask(
         pt_dataset=opts.data_path,
         mask_path=opts.mask_path,
         test_mask_path=opts.mask_path,
@@ -162,7 +162,7 @@ def build_datasets_and_loader_noalign(opts, logger, train_npz_list=None):
         drop_last=False,
     )
 
-    val_dataset = ContinuousEdgeLineDatasetMaskFinetune(
+    val_dataset = ContinuousLineDatasetMaskFinetune(
         pt_dataset=opts.validation_path,
         mask_path=opts.valid_mask_path,
         test_mask_path=opts.valid_mask_path,
