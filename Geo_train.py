@@ -55,11 +55,11 @@ os.environ.setdefault("NCCL_P2P_DISABLE", "0")
 os.environ.setdefault("NCCL_IB_DISABLE", "0")
 os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
 
-from datasets.dataset_TSR import (
+from datasets.dataset_Geo import (
     ContinuousEdgeLineDatasetMask,
     ContinuousEdgeLineDatasetMaskFinetune,
 )
-from src.models.TSR_model_RefKV import EdgeLineGPT256RelBCE, EdgeLineGPTConfig
+from src.models.Geo_model import EdgeLineGPT256RelBCE, EdgeLineGPTConfig
 from src.utils_RefKV import set_seed
 from datasets.check_ref_frame import run_check_ref_frame
 

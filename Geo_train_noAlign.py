@@ -17,7 +17,7 @@ import Geo_train as base
 _ORIG_BUILD_DATASETS_AND_LOADER = base.build_datasets_and_loader
 _ORIG_EVALUATE_SEQUENCE = base.evaluate_sequence
 _ORIG_LOAD_CONFIG_TO_OPTS = base.load_config_to_opts
-from datasets.dataset_TSR import (
+from datasets.dataset_Geo import (
     ContinuousEdgeLineDatasetMask,
     ContinuousEdgeLineDatasetMaskFinetune,
 )
@@ -83,23 +83,18 @@ class MaPDatasetWrapperNoAlign(Dataset):
         local_used = 0.0
 
         if self.no_global_ref:
-            g_edge = torch.zeros_like(curr_item["edge"])
             g_line = torch.zeros_like(curr_item["line"])
         elif idx == info["global_idx"]:
-            g_edge = curr_item["edge"]
             g_line = curr_item["line"]
         else:
             g_item = self.dataset[info["global_idx"]]
-            g_edge = g_item["edge"]
             g_line = g_item["line"]
 
         if self.no_local_ref or info["is_first"]:
-            l_edge_t = torch.zeros_like(curr_item["edge"])
             l_line_t = torch.zeros_like(curr_item["line"])
             l_mask_t = torch.ones_like(curr_item["mask"])
         else:
             prev_item = self.dataset[info["prev_idx"]]
-            l_edge_t = prev_item["edge"].clone()
             l_line_t = prev_item["line"].clone()
             l_mask_t = torch.zeros_like(curr_item["mask"])
             current_conf = 1.0
@@ -111,12 +106,9 @@ class MaPDatasetWrapperNoAlign(Dataset):
 
         return {
             "c_img": curr_item["img"].contiguous(),
-            "c_edge": curr_item["edge"].contiguous(),
             "c_line": curr_item["line"].contiguous(),
             "c_mask": curr_item["mask"].contiguous(),
-            "g_edge": g_edge.contiguous(),
             "g_line": g_line.contiguous(),
-            "l_edge": l_edge_t.contiguous(),
             "l_line": l_line_t.contiguous(),
             "l_mask": l_mask_t.contiguous(),
             "conf": torch.tensor(current_conf, dtype=torch.float32),
@@ -250,7 +242,6 @@ if __name__ == "__main__":
     parser.add_argument("--val_freq", type=int, default=2)
     parser.add_argument("--focal_weight", type=float, default=1.0)
     parser.add_argument("--tversky_weight", type=float, default=1.0)
-    parser.add_argument("--disable_edge", action="store_true")
     parser.add_argument("--line_tv_alpha", type=float, default=0.3)
     parser.add_argument("--line_tv_beta", type=float, default=0.7)
     parser.add_argument("--dilate_switch_ep", type=int, default=3)
