@@ -270,6 +270,12 @@ def _to_chw_01(t):
 
 
 def _to_bgr_u8(chw):
+    if chw.dim() != 3:
+        raise ValueError(f"Expected CHW tensor, got shape={tuple(chw.shape)}")
+    if chw.size(0) == 1:
+        chw = chw.repeat(3, 1, 1)
+    elif chw.size(0) not in (3, 4):
+        raise ValueError(f"Invalid channel count for visualization: C={chw.size(0)}")
     arr = (chw.permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
@@ -360,11 +366,13 @@ def main():
 
     line_pred = torch.sigmoid(line_logits).clamp(0, 1)
 
+    # Keep TB-style 3-channel overlay:
+    #   R: target GT line, G: predicted line, B: local reference line * alpha.
     overlay = torch.cat(
         [
-            _to_chw_01(t_line_gt),
-            _to_chw_01(line_pred),
-            (_to_chw_01(l_line) * 0.5).clamp(0, 1),
+            t_line_gt[0].clamp(0, 1),
+            line_pred[0].clamp(0, 1),
+            (l_line[0].clamp(0, 1) * 0.5),
         ],
         dim=0,
     )
