@@ -3,7 +3,7 @@
 # ===============================================================
 model_settings:
   name: "Geo_noAlign"
-  # pretrain_ckpt: "ckpt/best_transformer_places2.pth"
+  pretrain_ckpt: "ckpt/best_transformer_places2.pth"
   tb_images: True
   tb_max_images: 5
   tb_logdir: "/root/tf-logs/"
@@ -11,8 +11,8 @@ model_settings:
 training_params:
   lr: 1e-4
   train_epoch: 50
-  seq_batch: 110
-  num_workers: 6
+  seq_batch: 130
+  num_workers: 12
   prefetch_factor: 2
   AMP: True
   MaP: True
@@ -23,8 +23,6 @@ training_params:
   dilate1_ep: 30
   disable_edge: True
   accumulation_steps: 2  # 梯度累积补偿小 batch
-  no_align: True
-  # debug_line: True
 
 # ===============================================================
 # 数据集 1: DL3DV
@@ -33,11 +31,11 @@ dataset1:
   enable: True
   name: "DL3DV"
   ratio: 1
-  train_imgs_list: "data_list/DL3DV10K_imgs_train.py"
-  train_pkls_list: "data_list/DL3DV10K_pkls_train.py"
+  train_imgs_list: "data_list/DL3DV10K_imgs_train.txt"
+  train_pkls_list: "data_list/DL3DV10K_pkls_train.txt"
 
-  val_imgs_list: "filter_results/filter_DL3DV_val/train_imgs_clean.txt"
-  val_pkls_list: "filter_results/filter_DL3DV_val/train_pkls_clean.txt"
+  val_imgs_list: "filter_results/DL3DV10K_filtered_val/train_imgs_clean.txt"
+  val_pkls_list: "filter_results/DL3DV10K_filtered_val/train_pkls_clean.txt"
 
 # ===============================================================
 # 数据集 2: ScannetPP
@@ -46,8 +44,8 @@ dataset2:
   enable: True
   name: "ScannetPP"
   ratio: 1
-  train_imgs_list: "data_list/ScannetPP_imgs_train.py"
-  train_pkls_list: "data_list/ScannetPP_pkls_train.py"
+  train_imgs_list: "data_list/ScannetPP_imgs_train.txt"
+  train_pkls_list: "data_list/ScannetPP_pkls_train.txt"
 
   val_imgs_list: ""
   val_pkls_list: ""
@@ -58,3 +56,4 @@ dataset2:
 masks:
   train_mask_list: "/root/autodl-tmp/Inpainting/SfM_inpainting/data_list/irregular_mask_40_50.txt"
   val_mask_list: "/root/autodl-tmp/Inpainting/SfM_inpainting/data_list/irregular_mask_30_40.txt"
+  
