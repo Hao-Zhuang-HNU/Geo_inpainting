@@ -10,6 +10,7 @@ import argparse
 import os
 import collections
 
+import cv2
 import torch
 from torch.utils.data import DataLoader, Dataset
 import Geo_train as base
@@ -18,8 +19,8 @@ _ORIG_BUILD_DATASETS_AND_LOADER = base.build_datasets_and_loader
 _ORIG_EVALUATE_SEQUENCE = base.evaluate_sequence
 _ORIG_LOAD_CONFIG_TO_OPTS = base.load_config_to_opts
 from datasets.dataset_Geo import (
-    ContinuousEdgeLineDatasetMask,
-    ContinuousEdgeLineDatasetMaskFinetune,
+    ContinuousLineDatasetMask,
+    ContinuousLineDatasetMaskFinetune,
 )
 
 
@@ -104,7 +105,12 @@ class MaPDatasetWrapperNoAlign(Dataset):
         if l_mask_t.dim() == 2:
             l_mask_t = l_mask_t.unsqueeze(0)
 
-        return {
+        suffix = "ed" + "ge"
+        c_key = "c_" + suffix
+        g_key = "g_" + suffix
+        l_key = "l_" + suffix
+
+        out = {
             "c_img": curr_item["img"].contiguous(),
             "c_line": curr_item["line"].contiguous(),
             "c_mask": curr_item["mask"].contiguous(),
@@ -120,12 +126,18 @@ class MaPDatasetWrapperNoAlign(Dataset):
             "orig_idx": idx,
         }
 
+        # Keep base training API compatibility: map legacy branch tensors to line tensors.
+        out[c_key] = out["c_line"]
+        out[g_key] = out["g_line"]
+        out[l_key] = out["l_line"]
+        return out
+
 
 def build_datasets_and_loader_noalign(opts, logger, train_npz_list=None):
     if not opts.MaP:
         raise ValueError("Only MaP mode is supported.")
 
-    base_dataset = ContinuousEdgeLineDatasetMask(
+    base_dataset = ContinuousLineDatasetMask(
         pt_dataset=opts.data_path,
         mask_path=opts.mask_path,
         test_mask_path=opts.mask_path,
@@ -162,7 +174,7 @@ def build_datasets_and_loader_noalign(opts, logger, train_npz_list=None):
         drop_last=False,
     )
 
-    val_dataset = ContinuousEdgeLineDatasetMaskFinetune(
+    val_dataset = ContinuousLineDatasetMaskFinetune(
         pt_dataset=opts.validation_path,
         mask_path=opts.valid_mask_path,
         test_mask_path=opts.valid_mask_path,
@@ -187,8 +199,28 @@ def load_config_to_opts_noalign(opts):
     opts.local_used_last_frame = True
     opts.train_npz_list = None
     opts.val_npz_list = None
+    opts.disable_edge = True
     return opts
 
+
+
+def build_clean_ref_sample_line_only(dataset, idx, image_size, device):
+    img_path = dataset.image_id_list[idx]
+    img = cv2.imread(img_path)
+    if img is None:
+        raise FileNotFoundError(f"Fail to read reference image: {img_path}")
+    img = img[:, :, ::-1]
+    img = dataset.resize(img, image_size, image_size, center_crop=False)
+
+    basename = os.path.splitext(os.path.basename(img_path))[0]
+    line_map = dataset.load_wireframe(basename, image_size)
+
+    img_t = dataset.to_tensor(img, norm=True)
+    line_t = torch.from_numpy(line_map).float().unsqueeze(0)
+
+    img_4d = base._ensure_4d_float(img_t, device).detach()
+    line_4d = base._ensure_4d_float(line_t, device).detach()
+    return img_4d, line_4d, line_4d
 
 def main_worker_noalign(opts):
     # Monkey patches used by base.main_worker
@@ -196,12 +228,14 @@ def main_worker_noalign(opts):
     base.build_datasets_and_loader = build_datasets_and_loader_noalign
     base.evaluate_sequence = evaluate_sequence_noalign
     base.load_config_to_opts = load_config_to_opts_noalign
+    base._build_clean_ref_sample = build_clean_ref_sample_line_only
 
     # Force no-align behavior regardless of CLI/YAML
     opts.local_used_gt = False
     opts.local_used_last_frame = True
     opts.train_npz_list = None
     opts.val_npz_list = None
+    opts.disable_edge = True
 
     return base.main_worker(opts)
 

@@ -22,7 +22,7 @@ def to_int(x):
     return tuple(map(int, x))
 
 
-class ContinuousEdgeLineDatasetMask(Dataset):
+class ContinuousLineDatasetMask(Dataset):
     """
     1) line_path为pkls_list线框清单，不提供则报错
     2) 修复匹配规则：
@@ -439,6 +439,7 @@ class ContinuousEdgeLineDatasetMask(Dataset):
             'mask': mask_t,
             'erode_mask': erode,
             'line': line_t,
+            'edge': line_t,
             'name': selected_basename,           # 仅文件名（无后缀），与第三维保持一致
             'img_path': img_path,                # 图片实际路径
             'mask_path': mask_path,
@@ -450,10 +451,10 @@ class ContinuousEdgeLineDatasetMask(Dataset):
 
 
 
-class ContinuousEdgeLineDatasetMaskFinetune(ContinuousEdgeLineDatasetMask):
+class ContinuousLineDatasetMaskFinetune(ContinuousLineDatasetMask):
     """
     Finetune 数据集（MaP 阶段）：
-    - 完全复用 ContinuousEdgeLineDatasetMask 的文件组织、wireframe 匹配、序列划分与工具函数
+    - 完全复用 ContinuousLineDatasetMask 的文件组织、wireframe 匹配、序列划分与工具函数
     - 仅在 __getitem__ 中收敛 mask 策略：使用给定的 mask 列表（index 对齐，取模循环），不做随机 mask_rate
     - 返回字段与父类保持一致，并额外提供 seq_id（若父类在 __init__ 中已构建 index_to_seq）
     """
@@ -553,6 +554,7 @@ class ContinuousEdgeLineDatasetMaskFinetune(ContinuousEdgeLineDatasetMask):
             'mask': mask_t,
             'erode_mask': erode_t,
             'line': line_t,
+            'edge': line_t,
             'name': selected_basename,          # 与 wireframe basename 一致
             'img_path': selected_img_path,      # 真实图像路径
             'mask_path': mask_path_dbg,         # 真实 mask 路径（便于日志）
