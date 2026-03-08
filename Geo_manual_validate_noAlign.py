@@ -41,34 +41,118 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _get_nested(cfg, path):
+    cur = cfg
+    for k in path.split("."):
+        if not isinstance(cur, dict) or k not in cur:
+            return None
+        cur = cur[k]
+    return cur
+
+
+def _pick_first(cfg, paths):
+    for p in paths:
+        v = _get_nested(cfg, p)
+        if v is not None:
+            return v
+    return None
+
+
 def _apply_yaml_overrides(opts):
     if not opts.config_path or not os.path.exists(opts.config_path):
         return opts
     with open(opts.config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
 
-    # Match keys used by training configs.
-    model_cfg = cfg.get("model", {})
-    if "n_layer" in model_cfg:
-        opts.n_layer = int(model_cfg["n_layer"])
-    if "n_embd" in model_cfg:
-        opts.n_embd = int(model_cfg["n_embd"])
-    if "n_head" in model_cfg:
-        opts.n_head = int(model_cfg["n_head"])
-    if "pretrain_ckpt" in model_cfg and not opts.pretrain_ckpt:
-        opts.pretrain_ckpt = str(model_cfg["pretrain_ckpt"])
+    # Support multiple config styles: train config + manual config section.
+    # CLI still has highest priority; config only fills missing/default values.
+    if opts.n_layer == 16:
+        v = _pick_first(cfg, ["model.n_layer", "model_settings.n_layer", "manual_validate.n_layer"])
+        if v is not None:
+            opts.n_layer = int(v)
+    if opts.n_embd == 256:
+        v = _pick_first(cfg, ["model.n_embd", "model_settings.n_embd", "manual_validate.n_embd"])
+        if v is not None:
+            opts.n_embd = int(v)
+    if opts.n_head == 8:
+        v = _pick_first(cfg, ["model.n_head", "model_settings.n_head", "manual_validate.n_head"])
+        if v is not None:
+            opts.n_head = int(v)
 
-    ds_cfg = cfg.get("datasets", {})
-    if "validation_path" in ds_cfg and not opts.validation_path:
-        opts.validation_path = str(ds_cfg["validation_path"])
-    if "valid_mask_path" in ds_cfg and not opts.valid_mask_path:
-        opts.valid_mask_path = str(ds_cfg["valid_mask_path"])
-    if "val_wireframes_list" in ds_cfg and not opts.val_wireframes_list:
-        opts.val_wireframes_list = str(ds_cfg["val_wireframes_list"])
-    if "mask_rates" in ds_cfg and opts.mask_rates == [0.4, 0.8, 1.0]:
-        opts.mask_rates = list(ds_cfg["mask_rates"])
-    if "image_size" in ds_cfg and opts.image_size == 256:
-        opts.image_size = int(ds_cfg["image_size"])
+    if not opts.pretrain_ckpt:
+        v = _pick_first(cfg, ["model.pretrain_ckpt", "model_settings.pretrain_ckpt", "manual_validate.pretrain_ckpt"])
+        if v is not None:
+            opts.pretrain_ckpt = str(v)
+
+    if not opts.validation_path:
+        v = _pick_first(cfg, [
+            "datasets.validation_path",
+            "manual_validate.validation_path",
+            "manual_validate.val_imgs_list",
+            "dataset1.val_imgs_list",
+        ])
+        if v is not None:
+            opts.validation_path = str(v)
+
+    if not opts.val_wireframes_list:
+        v = _pick_first(cfg, [
+            "datasets.val_wireframes_list",
+            "manual_validate.val_wireframes_list",
+            "manual_validate.val_pkls_list",
+            "dataset1.val_pkls_list",
+        ])
+        if v is not None:
+            opts.val_wireframes_list = str(v)
+
+    if not opts.valid_mask_path:
+        v = _pick_first(cfg, [
+            "datasets.valid_mask_path",
+            "masks.val_mask_list",
+            "manual_validate.valid_mask_path",
+            "manual_validate.val_mask_list",
+        ])
+        if v is not None:
+            opts.valid_mask_path = str(v)
+
+    if opts.mask_rates == [0.4, 0.8, 1.0]:
+        v = _pick_first(cfg, ["datasets.mask_rates", "manual_validate.mask_rates"])
+        if v is not None:
+            opts.mask_rates = [float(x) for x in v]
+
+    if opts.image_size == 256:
+        v = _pick_first(cfg, ["datasets.image_size", "manual_validate.image_size"])
+        if v is not None:
+            opts.image_size = int(v)
+
+    if not opts.AMP:
+        v = _pick_first(cfg, ["training_params.AMP", "manual_validate.AMP"])
+        if v is not None:
+            opts.AMP = bool(v)
+
+    if opts.device == "cuda":
+        v = _pick_first(cfg, ["manual_validate.device"])
+        if v is not None:
+            opts.device = str(v)
+
+    if opts.seq_id is None:
+        v = _pick_first(cfg, ["manual_validate.seq_id"])
+        if v is not None:
+            opts.seq_id = str(v)
+
+    if opts.index is None:
+        v = _pick_first(cfg, ["manual_validate.index"])
+        if v is not None:
+            opts.index = int(v)
+
+    if opts.position == "last":
+        v = _pick_first(cfg, ["manual_validate.position"])
+        if v is not None:
+            opts.position = str(v)
+
+    if opts.output == "manual_val_tb_collage.jpg":
+        v = _pick_first(cfg, ["manual_validate.output"])
+        if v is not None:
+            opts.output = str(v)
 
     return opts
 
