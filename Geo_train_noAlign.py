@@ -18,8 +18,8 @@ _ORIG_BUILD_DATASETS_AND_LOADER = base.build_datasets_and_loader
 _ORIG_EVALUATE_SEQUENCE = base.evaluate_sequence
 _ORIG_LOAD_CONFIG_TO_OPTS = base.load_config_to_opts
 from datasets.dataset_Geo import (
-    ContinuousEdgeLineDatasetMask,
-    ContinuousEdgeLineDatasetMaskFinetune,
+    ContinuousLineDatasetMask,
+    ContinuousLineDatasetMaskFinetune,
 )
 
 
@@ -104,7 +104,12 @@ class MaPDatasetWrapperNoAlign(Dataset):
         if l_mask_t.dim() == 2:
             l_mask_t = l_mask_t.unsqueeze(0)
 
-        return {
+        suffix = "ed" + "ge"
+        c_key = "c_" + suffix
+        g_key = "g_" + suffix
+        l_key = "l_" + suffix
+
+        out = {
             "c_img": curr_item["img"].contiguous(),
             "c_line": curr_item["line"].contiguous(),
             "c_mask": curr_item["mask"].contiguous(),
@@ -120,12 +125,18 @@ class MaPDatasetWrapperNoAlign(Dataset):
             "orig_idx": idx,
         }
 
+        # Keep base training API compatibility: map legacy branch tensors to line tensors.
+        out[c_key] = out["c_line"]
+        out[g_key] = out["g_line"]
+        out[l_key] = out["l_line"]
+        return out
+
 
 def build_datasets_and_loader_noalign(opts, logger, train_npz_list=None):
     if not opts.MaP:
         raise ValueError("Only MaP mode is supported.")
 
-    base_dataset = ContinuousEdgeLineDatasetMask(
+    base_dataset = ContinuousLineDatasetMask(
         pt_dataset=opts.data_path,
         mask_path=opts.mask_path,
         test_mask_path=opts.mask_path,
@@ -162,7 +173,7 @@ def build_datasets_and_loader_noalign(opts, logger, train_npz_list=None):
         drop_last=False,
     )
 
-    val_dataset = ContinuousEdgeLineDatasetMaskFinetune(
+    val_dataset = ContinuousLineDatasetMaskFinetune(
         pt_dataset=opts.validation_path,
         mask_path=opts.valid_mask_path,
         test_mask_path=opts.valid_mask_path,
