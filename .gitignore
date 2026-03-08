@@ -16,5 +16,6 @@ filter_results/
 .ipynb_checkpoints/
 ##屏蔽IDE配置文件
 .vscode/
+__pycache__/
 ##屏蔽依赖目录
 

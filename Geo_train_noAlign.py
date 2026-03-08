@@ -17,7 +17,6 @@ import Geo_train as base
 _ORIG_BUILD_DATASETS_AND_LOADER = base.build_datasets_and_loader
 _ORIG_EVALUATE_SEQUENCE = base.evaluate_sequence
 _ORIG_LOAD_CONFIG_TO_OPTS = base.load_config_to_opts
-_ORIG_PREPARE_FIXED_VALIDATION_SET = base.prepare_fixed_validation_set
 from datasets.dataset_TSR import (
     ContinuousEdgeLineDatasetMask,
     ContinuousEdgeLineDatasetMaskFinetune,
@@ -189,34 +188,6 @@ def evaluate_sequence_noalign(model, val_dataset, seq_to_ref, device, logger, am
     return _ORIG_EVALUATE_SEQUENCE(model, val_dataset, seq_to_ref, device, logger, amp, opts, writer=writer, epoch=epoch, val_npz_list=None)
 
 
-def prepare_fixed_validation_set_noalign(opts, val_dataset, logger):
-    """Reuse base fixed-frame selection, then remap seq keys for TB to真实序列名."""
-    _ORIG_PREPARE_FIXED_VALIDATION_SET(opts, val_dataset, logger)
-
-    fixed_meta = getattr(opts, "_val_viz_fixed15_meta", {})
-    if not fixed_meta:
-        return
-
-    remapped = {}
-    for old_sid, info in fixed_meta.items():
-        t_idx = int(info.get("t_idx", -1))
-        seq_name = str(old_sid)
-
-        if 0 <= t_idx < len(getattr(val_dataset, "image_id_list", [])):
-            img_path = val_dataset.image_id_list[t_idx]
-            seq_name = os.path.basename(os.path.dirname(img_path)) or os.path.dirname(img_path) or str(old_sid)
-
-        final_name = seq_name
-        dedup_id = 1
-        while final_name in remapped:
-            dedup_id += 1
-            final_name = f"{seq_name}_{dedup_id}"
-
-        remapped[final_name] = info
-
-    opts._val_viz_fixed15_meta = remapped
-
-
 def load_config_to_opts_noalign(opts):
     opts = _ORIG_LOAD_CONFIG_TO_OPTS(opts)
     # Force no-align behavior
@@ -233,7 +204,6 @@ def main_worker_noalign(opts):
     base.build_datasets_and_loader = build_datasets_and_loader_noalign
     base.evaluate_sequence = evaluate_sequence_noalign
     base.load_config_to_opts = load_config_to_opts_noalign
-    base.prepare_fixed_validation_set = prepare_fixed_validation_set_noalign
 
     # Force no-align behavior regardless of CLI/YAML
     opts.local_used_gt = False
