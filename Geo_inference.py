@@ -7,8 +7,8 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from datasets.dataset_TSR import ContinuousEdgeLineDatasetMask
-from src.models.TSR_model_RefKV import EdgeLineGPTConfig, EdgeLineGPT256RelBCE
+from datasets.dataset_Geo import ContinuousEdgeLineDatasetMask
+from src.models.Geo_model import EdgeLineGPTConfig, EdgeLineGPT256RelBCE
 from src.utils_RefKV import set_seed, SampleEdgeLineLogitsWithRefExtraction
 
 

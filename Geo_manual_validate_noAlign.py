@@ -15,7 +15,7 @@ import torch
 import yaml
 
 import Geo_train as base
-from datasets.dataset_TSR import ContinuousEdgeLineDatasetMaskFinetune
+from datasets.dataset_Geo import ContinuousEdgeLineDatasetMaskFinetune
 
 
 def _build_parser() -> argparse.ArgumentParser:
