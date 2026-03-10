@@ -45,8 +45,7 @@ dataset2:
   name: "ScannetPP"
   ratio: 1
   train_imgs_list: "filter_results/ScannetPP_train_line40/train_imgs_clean.txt"
-  train_pkls_list: "filter_results/ScannetPP_train_line40/train_imgs_clean.txt"
-
+  train_pkls_list: "filter_results/ScannetPP_train_line40/train_pkls_clean.txt"
   val_imgs_list: ""
   val_pkls_list: ""
 
