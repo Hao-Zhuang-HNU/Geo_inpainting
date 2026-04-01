@@ -19,10 +19,10 @@ warnings.filterwarnings("ignore")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="AnimateDiff Ablation Study - With/Without Wireframe")
-    # 更新了 help 描述
-    parser.add_argument('--img_list', type=str, required=True, help='Path to image list file OR directory containing images')
-    parser.add_argument('--mask_list', type=str, required=True, help='Path to mask list file OR directory containing masks')
-    parser.add_argument('--line_list', type=str, required=False, default=None, help='Path to line list file OR directory (Optional for ablation)')
+    parser.add_argument('--img_list', type=str, required=True)
+    parser.add_argument('--mask_list', type=str, required=True)
+    # 【修改】line_list 变为可选
+    parser.add_argument('--line_list', type=str, required=False, default=None, help='Path to line list (Optional for ablation)')
     parser.add_argument('--output_dir', type=str, required=True)
     
     parser.add_argument('--prompt', type=str, default="high quality, realistic, interior design, photorealistic, cinematic lighting, ultra-detailed", help='Positive prompt')
@@ -34,37 +34,11 @@ def parse_args():
     parser.add_argument('--ip_scale', type=float, default=0.7) 
     return parser.parse_args()
 
-# ================= 修改后的加载函数 =================
-def get_file_list(path):
-    """
-    加载文件列表。
-    - 如果 path 是目录：扫描目录下所有图片并排序返回。
-    - 如果 path 是文件：按行读取（原逻辑）。
-    - 如果 path 是 None：返回 None。
-    """
+def load_file_list(path):
     if path is None:
         return None
-    
-    if os.path.isdir(path):
-        # 支持的图片扩展名
-        valid_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp')
-        # 扫描并排序，确保帧顺序正确
-        files = sorted([
-            os.path.join(path, f) 
-            for f in os.listdir(path) 
-            if f.lower().endswith(valid_exts)
-        ])
-        if not files:
-            print(f">>> WARNING: No images found in directory: {path}")
-        return files
-        
-    elif os.path.isfile(path):
-        with open(path, 'r') as f:
-            return [line.strip() for line in f.readlines() if line.strip()]
-    
-    else:
-        raise ValueError(f"Path does not exist: {path}")
-# ===================================================
+    with open(path, 'r') as f:
+        return [line.strip() for line in f.readlines() if line.strip()]
 
 def add_texture_grain(img_np, sigma=1.2):
     noise = np.random.normal(0, sigma, img_np.shape).astype(np.float32)
@@ -107,20 +81,16 @@ def main():
     pipe.set_ip_adapter_scale(args.ip_scale)
     pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config, beta_schedule="linear")
 
-    # ================= 2. 数据准备 (使用新函数) =================
-    img_paths = get_file_list(args.img_list)
-    mask_paths = get_file_list(args.mask_list)
-    line_paths = get_file_list(args.line_list)
-    
-    # 基本检查
-    if len(img_paths) == 0:
-        raise ValueError("Image list is empty!")
+    # ================= 2. 数据准备 =================
+    img_paths = load_file_list(args.img_list)
+    mask_paths = load_file_list(args.mask_list)
+    line_paths = load_file_list(args.line_list)
     
     os.makedirs(args.output_dir, exist_ok=True)
     
     # 模式判定
-    if line_paths is None or len(line_paths) == 0:
-        print(">>> WARNING: line_list NOT provided (or empty). Running ABLATION MODE (No structure guidance).")
+    if line_paths is None:
+        print(">>> WARNING: line_list NOT provided. Running ABLATION MODE (No structure guidance).")
         use_line_guidance = False
     else:
         print(">>> INFO: line_list provided. Running FULL MODE (Structure-guided).")
@@ -128,8 +98,6 @@ def main():
 
     chunk_size = args.context_length
     total_images = len(img_paths)
-    
-    print(f"Total images to process: {total_images}")
 
     for start_idx in tqdm(range(0, total_images, chunk_size)):
         end_idx = min(start_idx + chunk_size, total_images)
@@ -142,9 +110,7 @@ def main():
         for i in range(start_idx, end_idx):
             # 处理 Line / Control Image
             if use_line_guidance:
-                # 确保 line_paths 索引不越界 (如果文件数量不一致)
-                idx_line = i if i < len(line_paths) else i % len(line_paths)
-                l_img = Image.open(line_paths[idx_line]).convert("RGB").resize((512, 512))
+                l_img = Image.open(line_paths[i]).convert("RGB").resize((512, 512))
                 if np.array(l_img).mean() < 127: l_img = ImageOps.invert(l_img)
                 batch_ctrl.append(l_img)
             else:
@@ -152,10 +118,7 @@ def main():
                 batch_ctrl.append(Image.new("RGB", (512, 512), (0, 0, 0)))
             
             # Mask & Orig
-            # 确保 mask_paths 索引不越界
-            idx_mask = i if i < len(mask_paths) else i % len(mask_paths)
-            batch_masks.append(Image.open(mask_paths[idx_mask]).convert("L").resize((512, 512)))
-            
+            batch_masks.append(Image.open(mask_paths[i % len(mask_paths)]).convert("L").resize((512, 512)))
             batch_orig.append(Image.open(img_paths[i]).convert("RGB").resize((512, 512)))
             filenames.append(os.path.basename(img_paths[i]))
 
