@@ -37,6 +37,18 @@ def parse_args():
 def load_file_list(path):
     if path is None:
         return None
+    if os.path.isdir(path):
+        valid_exts = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+        file_list = [
+            os.path.join(path, name)
+            for name in sorted(os.listdir(path))
+            if os.path.isfile(os.path.join(path, name)) and name.lower().endswith(valid_exts)
+        ]
+        if not file_list:
+            raise ValueError(f"No image files found in directory: {path}")
+        return file_list
+    if os.path.isfile(path) and path.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".webp")):
+        return [path]
     with open(path, 'r') as f:
         return [line.strip() for line in f.readlines() if line.strip()]
 
@@ -85,6 +97,12 @@ def main():
     img_paths = load_file_list(args.img_list)
     mask_paths = load_file_list(args.mask_list)
     line_paths = load_file_list(args.line_list)
+
+    if line_paths is not None and len(line_paths) < len(img_paths):
+        raise ValueError(
+            f"line inputs are insufficient: got {len(line_paths)} line image(s), "
+            f"but need at least {len(img_paths)} to match img_list"
+        )
     
     os.makedirs(args.output_dir, exist_ok=True)
     
