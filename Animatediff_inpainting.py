@@ -21,8 +21,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="AnimateDiff Ablation Study - With/Without Wireframe")
     parser.add_argument('--img_list', type=str, required=True)
     parser.add_argument('--mask_list', type=str, required=True)
-    # 【修改】line_list 变为可选
-    parser.add_argument('--line_list', type=str, required=False, default=None, help='Path to line list (Optional for ablation)')
+    parser.add_argument('--line_path', type=str, required=True, help='Directory path for line images')
     parser.add_argument('--output_dir', type=str, required=True)
     
     parser.add_argument('--prompt', type=str, default="high quality, realistic, interior design, photorealistic, cinematic lighting, ultra-detailed", help='Positive prompt')
@@ -39,6 +38,15 @@ def load_file_list(path):
         return None
     with open(path, 'r') as f:
         return [line.strip() for line in f.readlines() if line.strip()]
+
+def load_image_paths_from_dir(dir_path):
+    valid_exts = {'.png', '.jpg', '.jpeg', '.bmp', '.webp'}
+    image_paths = []
+    for filename in sorted(os.listdir(dir_path)):
+        file_path = os.path.join(dir_path, filename)
+        if os.path.isfile(file_path) and os.path.splitext(filename.lower())[1] in valid_exts:
+            image_paths.append(file_path)
+    return image_paths
 
 def add_texture_grain(img_np, sigma=1.2):
     noise = np.random.normal(0, sigma, img_np.shape).astype(np.float32)
@@ -84,17 +92,14 @@ def main():
     # ================= 2. 数据准备 =================
     img_paths = load_file_list(args.img_list)
     mask_paths = load_file_list(args.mask_list)
-    line_paths = load_file_list(args.line_list)
+    line_paths = load_image_paths_from_dir(args.line_path)
     
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # 模式判定
-    if line_paths is None:
-        print(">>> WARNING: line_list NOT provided. Running ABLATION MODE (No structure guidance).")
-        use_line_guidance = False
-    else:
-        print(">>> INFO: line_list provided. Running FULL MODE (Structure-guided).")
-        use_line_guidance = True
+    if len(line_paths) == 0:
+        raise ValueError(f"No line images found in directory: {args.line_path}")
+    print(">>> INFO: line_path provided. Running FULL MODE (Structure-guided).")
+    use_line_guidance = True
 
     chunk_size = args.context_length
     total_images = len(img_paths)
@@ -109,13 +114,9 @@ def main():
 
         for i in range(start_idx, end_idx):
             # 处理 Line / Control Image
-            if use_line_guidance:
-                l_img = Image.open(line_paths[i]).convert("RGB").resize((512, 512))
-                if np.array(l_img).mean() < 127: l_img = ImageOps.invert(l_img)
-                batch_ctrl.append(l_img)
-            else:
-                # 【新模式逻辑】生成全黑图作为占位符
-                batch_ctrl.append(Image.new("RGB", (512, 512), (0, 0, 0)))
+            l_img = Image.open(line_paths[i % len(line_paths)]).convert("RGB").resize((512, 512))
+            if np.array(l_img).mean() < 127: l_img = ImageOps.invert(l_img)
+            batch_ctrl.append(l_img)
             
             # Mask & Orig
             batch_masks.append(Image.open(mask_paths[i % len(mask_paths)]).convert("L").resize((512, 512)))
@@ -125,15 +126,12 @@ def main():
         # --- 生成 ---
         generator = torch.Generator("cpu").manual_seed(args.seed)
         
-        # 【新模式逻辑】如果无线框，将权重设为 0
-        current_ctrl_scale = 1.0 if use_line_guidance else 0.0
-        
         output = pipe(
             prompt=args.prompt, negative_prompt=args.negative_prompt, num_frames=end_idx - start_idx,
             guidance_scale=7.5, num_inference_steps=25, generator=generator,
             ip_adapter_image=ref_style_image, 
             conditioning_frames=batch_ctrl, 
-            controlnet_conditioning_scale=current_ctrl_scale,
+            controlnet_conditioning_scale=1.0,
         )
         frames = output.frames[0]
 
@@ -159,7 +157,7 @@ def main():
 
             final_img.resize((256, 256)).save(os.path.join(args.output_dir, filenames[j]))
 
-    print(f"Inpainting Done. Mode: {'Full' if use_line_guidance else 'Ablation (No Line)'}")
+    print("Inpainting Done. Mode: Full")
 
 if __name__ == "__main__":
     main()
