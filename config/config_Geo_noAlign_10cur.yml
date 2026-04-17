@@ -2,7 +2,7 @@
 # 全局训练配置 (Global Training Settings)
 # ===============================================================
 model_settings:
-  name: "Geo_localLastFrame"
+  name: "Geo_10cur"
   pretrain_ckpt: "ckpt/best_transformer_places2.pth"
   tb_images: True
   tb_max_images: 5
@@ -11,8 +11,8 @@ model_settings:
 training_params:
   lr: 1e-4
   train_epoch: 50
-  seq_batch: 110
-  num_workers: 6
+  seq_batch: 130
+  num_workers: 12
   prefetch_factor: 2
   AMP: True
   MaP: True
@@ -20,11 +20,9 @@ training_params:
   tversky_weight: 1.0
   line_tv_alpha: 0.4
   line_tv_beta: 0.6
-  dilate1_ep: 30
+  dilate1_ep: 10
   disable_edge: True
   accumulation_steps: 2  # 梯度累积补偿小 batch
-  # no_align: True
-  # debug_line: True
 
 # ===============================================================
 # 数据集 1: DL3DV
@@ -33,13 +31,11 @@ dataset1:
   enable: True
   name: "DL3DV"
   ratio: 1
-  train_imgs_list: "filter_results/DL3DV10K_filtered_40/train_imgs_clean.txt"
-  train_pkls_list: "filter_results/DL3DV10K_filtered_40/train_pkls_clean.txt"
-  train_npzs_list: "filter_results/DL3DV10K_filtered_40/train_npzs_clean.txt"
+  train_imgs_list: "filter_results/DL3DV10K_filtered_line40/train_imgs_clean.txt"
+  train_pkls_list: "filter_results/DL3DV10K_filtered_line40/train_pkls_clean.txt"
 
   val_imgs_list: "filter_results/DL3DV10K_filtered_val/train_imgs_clean.txt"
   val_pkls_list: "filter_results/DL3DV10K_filtered_val/train_pkls_clean.txt"
-  val_npzs_list: "filter_results/DL3DV10K_filtered_val/train_npzs_clean.txt"
 
 # ===============================================================
 # 数据集 2: ScannetPP
@@ -48,14 +44,10 @@ dataset2:
   enable: True
   name: "ScannetPP"
   ratio: 1
-  train_imgs_list: "filter_results/ScannetPP_filtered_40/train_imgs_clean.txt"
-  train_pkls_list: "filter_results/ScannetPP_filtered_40/train_pkls_clean.txt"
-  train_npzs_list: "filter_results/ScannetPP_filtered_40/train_npzs_clean.txt"
-
+  train_imgs_list: "filter_results/ScannetPP_train_line40/train_imgs_clean.txt"
+  train_pkls_list: "filter_results/ScannetPP_train_line40/train_pkls_clean.txt"
   val_imgs_list: ""
   val_pkls_list: ""
-  val_npzs_list: ""
-
 
 # ===============================================================
 # 掩码配置 (全局共用)
@@ -63,3 +55,4 @@ dataset2:
 masks:
   train_mask_list: "/root/autodl-tmp/Inpainting/SfM_inpainting/data_list/irregular_mask_40_50.txt"
   val_mask_list: "/root/autodl-tmp/Inpainting/SfM_inpainting/data_list/irregular_mask_30_40.txt"
+  
