@@ -94,8 +94,10 @@ def build_model(opts):
     return model
 
 
-def save_pred(prob, gt, mask, out_file):
+def save_pred(prob, gt, mask, out_file, binary_threshold=None):
     pred_np = _tensor_to_np(prob)
+    if binary_threshold is not None:
+        pred_np = (pred_np >= binary_threshold).astype(np.float32)
     gt_np = _tensor_to_np(gt)
     mask_np = _tensor_to_np(mask)
     merged = pred_np * mask_np + gt_np * (1 - mask_np)
@@ -143,7 +145,13 @@ def geo_inference(opts):
 
     # 保存第一帧预测，并作为后续 global/local 的“生成参考帧”
     pred_edge_prev = save_pred(edge0[0], gt_e0, mask0, os.path.join(opts.save_url, 'edge', name0))
-    pred_line_prev = save_pred(line0[0], gt_l0, mask0, os.path.join(opts.save_url, 'line', name0))
+    pred_line_prev = save_pred(
+        line0[0],
+        gt_l0,
+        mask0,
+        os.path.join(opts.save_url, 'line', name0),
+        binary_threshold=opts.line_binary_thresh if opts.solid_line else None,
+    )
 
     global_edge_gen = pred_edge_prev.clone()
     global_line_gen = pred_line_prev.clone()
@@ -192,7 +200,13 @@ def geo_inference(opts):
             )
 
         pred_edge_prev = save_pred(edge_pred[0], gt_e, mask, os.path.join(opts.save_url, 'edge', name))
-        pred_line_prev = save_pred(line_pred[0], gt_l, mask, os.path.join(opts.save_url, 'line', name))
+        pred_line_prev = save_pred(
+            line_pred[0],
+            gt_l,
+            mask,
+            os.path.join(opts.save_url, 'line', name),
+            binary_threshold=opts.line_binary_thresh if opts.solid_line else None,
+        )
 
 
 if __name__ == '__main__':
@@ -213,6 +227,10 @@ if __name__ == '__main__':
     parser.add_argument('--ref_dilate', type=int, default=3)
     parser.add_argument('--dilate_line', type=int, default=1, choices=[1, 3],
                         help='Optional GT line dilation size to match training strategy.')
+    parser.add_argument('--solid_line', action='store_true',
+                        help='If set, binarize generated line output to get solid lines.')
+    parser.add_argument('--line_binary_thresh', type=float, default=0.5,
+                        help='Threshold used when --solid_line is enabled.')
 
     args = parser.parse_args()
     os.environ['CUDA_VISIBLE_DEVICES'] = args.GPU_ids
