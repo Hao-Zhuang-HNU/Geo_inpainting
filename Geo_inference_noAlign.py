@@ -230,7 +230,7 @@ if __name__ == '__main__':
     parser.add_argument('--solid_line', action='store_true',
                         help='If set, binarize generated line output to get solid lines.')
     parser.add_argument('--line_binary_thresh', type=float, default=0.5,
-                        help='Threshold used when --solid_line is enabled.')
+                        help='Threshold used whe n --solid_line is enabled.')
 
     args = parser.parse_args()
     os.environ['CUDA_VISIBLE_DEVICES'] = args.GPU_ids

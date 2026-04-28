@@ -12,7 +12,7 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 import matplotlib
 matplotlib.use("Agg")
@@ -70,8 +70,13 @@ def render_wireframe_mask(
     flip_ud: bool = True,
 ) -> np.ndarray:
     """
-    按你给出的 save_wireframe 逻辑，直接渲染为 numpy 二值图。
+    将 pkl 中的线段渲染为二值线框图。
     输出: HxW, uint8, 0/1
+
+    重要修改：
+        原版本使用 matplotlib.plot 保存 PNG。即使 linewidth=1.0，
+        Matplotlib 的抗锯齿、圆形端点、坐标栅格化也容易让保存图看起来偏粗。
+        这里改用 PIL.ImageDraw.line 做像素级绘制，line_width=1 时就是 1 像素宽。
 
     参数:
         invert_y: 保留原脚本兼容选项。
@@ -79,6 +84,7 @@ def render_wireframe_mask(
                  默认开启，用于修正 pkl 中 y 轴正负方向相反的问题。
     """
     W = H = int(size)
+    lw = max(1, int(round(line_width)))
 
     # 判断是否归一化坐标（0~1）：最大值 <= 1.5 视为归一化
     max_v = 0.0
@@ -86,13 +92,8 @@ def render_wireframe_mask(
         max_v = max(max_v, abs(x1), abs(y1), abs(x2), abs(y2))
     normalized = (max_v <= 1.5)
 
-    dpi = size
-    fig = plt.figure(figsize=(1, 1), dpi=dpi, facecolor="black")
-    ax = fig.add_axes([0, 0, 1, 1], facecolor="black")
-    ax.set_xlim(0, W - 1)
-    ax.set_ylim(0, H - 1)
-    ax.set_aspect("equal", adjustable="box")
-    ax.axis("off")
+    img = Image.new("L", (W, H), 0)
+    draw = ImageDraw.Draw(img)
 
     for x1, y1, x2, y2 in lines:
         if normalized:
@@ -103,30 +104,23 @@ def render_wireframe_mask(
         else:
             x1p, y1p, x2p, y2p = x1, y1, x2, y2
 
-        # 按要求交换 x/y：plot([y1,y2], [x1,x2])
-        ax.plot([y1p, y2p], [x1p, x2p], color="white", linewidth=line_width, solid_capstyle="round")
+        # 保持你原脚本的坐标交换逻辑：plot([y1,y2], [x1,x2])
+        # PIL 的坐标为 (col/x, row/y)，因此这里对应为 (y, x)。
+        p1 = (int(round(y1p)), int(round(x1p)))
+        p2 = (int(round(y2p)), int(round(x2p)))
+        draw.line([p1, p2], fill=255, width=lw)
+
+    arr = np.array(img, dtype=np.uint8)
+    mask = (arr > 127).astype(np.uint8)
 
     if invert_y:
-        ax.invert_yaxis()
-
-    # 渲染到内存，不落盘
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=dpi, facecolor="black")
-    plt.close(fig)
-    buf.seek(0)
-
-    img = Image.open(buf).convert("L")
-    arr = np.array(img, dtype=np.uint8)
-
-    # Matplotlib 抗锯齿后是灰度，阈值化成二值图
-    mask = (arr > 127).astype(np.uint8)
+        mask = np.flipud(mask).copy()
 
     # 修正：沿水平中线翻转（上下翻转）
     if flip_ud:
         mask = np.flipud(mask).copy()
 
     return mask
-
 
 def save_mask_png(mask: np.ndarray, output_path: str) -> None:
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -137,8 +131,12 @@ def save_mask_png(mask: np.ndarray, output_path: str) -> None:
 # Input image loading
 # -----------------------------
 
-def load_pred_png_mask(png_path: str, size: int = 256, threshold: int = 127) -> np.ndarray:
-    img = Image.open(png_path).convert("L")
+def load_pred_image_mask(image_path: str, size: int = 256, threshold: int = 127) -> np.ndarray:
+    """
+    读取预测线框图，兼容 PNG / JPG / JPEG。
+    输出: HxW, uint8, 0/1
+    """
+    img = Image.open(image_path).convert("L")
     if img.size != (size, size):
         img = img.resize((size, size), Image.NEAREST)
     arr = np.array(img, dtype=np.uint8)
@@ -225,7 +223,7 @@ def base_stem(path: str) -> str:
 
 
 def build_match_pairs(pred_root: str, gt_root: str) -> Tuple[List[Tuple[str, str, str]], List[str]]:
-    pred_files = find_files(pred_root, (".png",))
+    pred_files = find_files(pred_root, (".png", ".jpg", ".jpeg"))
     gt_files = find_files(gt_root, (".pkl",))
 
     pred_rel = {rel_stem(p, pred_root): p for p in pred_files}
@@ -269,7 +267,7 @@ def build_match_pairs(pred_root: str, gt_root: str) -> Tuple[List[Tuple[str, str
     # 3) 记录未匹配文件
     for p in pred_files:
         if p not in matched_pred:
-            warnings.append(f"[WARN] Unmatched pred png: {p}")
+            warnings.append(f"[WARN] Unmatched pred image: {p}")
     for g in gt_files:
         if g not in matched_gt:
             warnings.append(f"[WARN] Unmatched gt pkl: {g}")
@@ -291,7 +289,7 @@ def safe_mean(values: List[float], ignore_inf: bool = False) -> float:
 
 
 def evaluate_one_pair(
-    pred_png: str,
+    pred_image: str,
     gt_pkl: str,
     size: int,
     line_width: float,
@@ -300,7 +298,7 @@ def evaluate_one_pair(
     chamfer_empty_value: float,
     gt_render_save_path: Optional[str] = None,
 ) -> Dict[str, float]:
-    pred_mask = load_pred_png_mask(pred_png, size=size, threshold=threshold)
+    pred_mask = load_pred_image_mask(pred_image, size=size, threshold=threshold)
 
     gt_lines, _ = load_lines_from_pkl(gt_pkl)
     gt_mask = render_wireframe_mask(
@@ -332,14 +330,14 @@ def evaluate_one_pair(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="递归遍历生成线框 png 与真实线框 pkl，先将 GT pkl 渲染并做上下翻转（沿水平中线翻转），再评估 Precision / Recall / F1 / Chamfer Distance"
+        description="递归遍历生成线框图（png/jpg/jpeg）与真实线框 pkl，先将 GT pkl 渲染并做上下翻转（沿水平中线翻转），再评估 Precision / Recall / F1 / Chamfer Distance"
     )
-    parser.add_argument("--input_line", type=str, required=True, help="生成线框 png 根目录")
+    parser.add_argument("--input_line", type=str, required=True, help="生成线框图根目录，支持 .png/.jpg/.jpeg")
     parser.add_argument("--gt_line", type=str, required=True, help="真实线框 pkl 根目录")
     parser.add_argument("--size", type=int, default=256, help="渲染/比较图尺寸，默认 256")
     parser.add_argument("--line_width", type=float, default=1.0, help="GT 线宽，默认 1.0")
     parser.add_argument("--invert_y", action="store_true", help="渲染 GT 时是否 invert_y")
-    parser.add_argument("--threshold", type=int, default=127, help="png 二值化阈值，默认 127")
+    parser.add_argument("--threshold", type=int, default=127, help="预测线框图二值化阈值，默认 127")
     parser.add_argument(
         "--save_gt_render_dir",
         type=str,
@@ -376,7 +374,7 @@ def main() -> int:
         print(w)
 
     if not pairs:
-        print("[ERROR] No matched png/pkl pairs found.", file=sys.stderr)
+        print("[ERROR] No matched image/pkl pairs found.", file=sys.stderr)
         return 2
 
     rows = []
@@ -388,13 +386,13 @@ def main() -> int:
     print(f"[INFO] Matched pairs: {len(pairs)}")
     print("=" * 120)
 
-    for idx, (key, pred_png, gt_pkl) in enumerate(pairs, start=1):
+    for idx, (key, pred_image, gt_pkl) in enumerate(pairs, start=1):
         gt_render_save_path = None
         if args.save_gt_render_dir is not None:
             gt_render_save_path = os.path.join(args.save_gt_render_dir, key + ".png")
 
         metrics = evaluate_one_pair(
-            pred_png=pred_png,
+            pred_image=pred_image,
             gt_pkl=gt_pkl,
             size=args.size,
             line_width=args.line_width,
@@ -406,7 +404,7 @@ def main() -> int:
 
         row = {
             "id": key,
-            "pred_png": pred_png,
+            "pred_image": pred_image,
             "gt_pkl": gt_pkl,
             **metrics,
         }
@@ -441,7 +439,7 @@ def main() -> int:
     if args.csv_out is not None:
         os.makedirs(os.path.dirname(args.csv_out) or ".", exist_ok=True)
         fieldnames = [
-            "id", "pred_png", "gt_pkl",
+            "id", "pred_image", "gt_pkl",
             "precision", "recall", "f1", "chamfer_distance",
             "tp", "fp", "fn", "pred_pixels", "gt_pixels"
         ]
