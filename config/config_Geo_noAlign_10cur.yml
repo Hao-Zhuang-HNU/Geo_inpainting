@@ -53,6 +53,6 @@ dataset2:
 # 掩码配置 (全局共用)
 # ===============================================================
 masks:
-  train_mask_list: "/root/autodl-tmp/Inpainting/SfM_inpainting/data_list/irregular_mask_40_50.txt"
-  val_mask_list: "/root/autodl-tmp/Inpainting/SfM_inpainting/data_list/irregular_mask_30_40.txt"
+  train_mask_list: "./data_list/irregular_mask_40_50.txt"
+  val_mask_list: "./data_list/irregular_mask_30_40.txt"
   
