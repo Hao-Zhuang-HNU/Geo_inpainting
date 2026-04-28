@@ -14,6 +14,7 @@ ckpt/
 1e1a_flow_test/
 filter_results/
 gt_line/
+line_postprocess_output/
 ##屏蔽特定类型文件
 .ipynb_checkpoints/
 ##屏蔽IDE配置文件
