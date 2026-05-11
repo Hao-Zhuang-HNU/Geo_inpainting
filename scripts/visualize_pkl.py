@@ -173,8 +173,8 @@ def main():
         help="可选：自定义输出路径模板，如 '/data/vis/{stem}_wire.png' 或 './out/{basename}.png'",
     )
     parser.add_argument("--size", type=int, default=256, help="输出分辨率，默认 256")
-    parser.add_argument("--line_width", type=float, default=1.0, help="线宽，默认 1.0")
-    parser.add_argument("--invert_y", action="store_true", help="可选：反转 y 轴（更像图像坐标：y向下）")
+    parser.add_argument("--line_width", type=float, default=0.3, help="线宽，默认 1.0")
+    parser.add_argument("--invert_y", action="store_false", help="可选：反转 y 轴（更像图像坐标：y向下）")
     parser.add_argument("--recursive", action="store_true", help="若输入为目录则递归搜索 *.pkl")
     args = parser.parse_args()
 

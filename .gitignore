@@ -1,13 +1,14 @@
 ##屏蔽目录
 tsr_output/
-eval_out/
+eval_out_video/
+eval_out_line/
 results/
 tb_logs/
 test_list/
 DL3DV_testlist/
 ScannetPP_testlist/
+MVImgNet_testlist/
 data_list/
-1e1a_flow_test/
 debug_test/
 debug_line/
 ckpt/
