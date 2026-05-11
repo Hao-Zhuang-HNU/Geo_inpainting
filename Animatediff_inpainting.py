@@ -170,22 +170,17 @@ def main():
             # V8 收缩掩码截取
             kernel_erode = np.ones((23, 23), np.uint8)
             eroded_mask_np = cv2.erode(mask_np, kernel_erode, iterations=1)
-            soft_mask_np = np.array(
-                Image.fromarray(eroded_mask_np).filter(ImageFilter.GaussianBlur(radius=10)),
-                dtype=np.float32,
-            ) / 255.0
+            soft_mask_pil = Image.fromarray(eroded_mask_np).filter(ImageFilter.GaussianBlur(radius=10))
 
-            # 防止软掩码向 mask 外泄漏：将权重严格限制在原始 mask 内
-            hard_mask_np = (mask_np > 127).astype(np.float32)
-            alpha_np = np.clip(soft_mask_np * hard_mask_np, 0.0, 1.0)[..., None]
+            # 回退到原始 PIL 融合流程（更稳定），并额外强制 mask 外像素保持原图
+            blended = Image.composite(gen_textured_pil, orig_img_pil, soft_mask_pil)
+            final_img = Image.composite(blended, orig_img_pil, ImageOps.invert(mask_pil))
 
-            blended_np = (
-                gen_textured_np.astype(np.float32) * alpha_np
-                + orig_np.astype(np.float32) * (1.0 - alpha_np)
-            )
-            # 保险措施：mask 外像素强制回填原图，彻底消除边缘阴影
-            final_np = np.where(hard_mask_np[..., None] > 0, blended_np, orig_np.astype(np.float32))
-            final_img = Image.fromarray(np.clip(final_np, 0, 255).astype(np.uint8))
+            # 仅在原始 mask 内保留融合结果，彻底消除 mask 外边缘阴影
+            final_np = np.array(final_img)
+            hard_mask_np = (mask_np > 127)
+            final_np[~hard_mask_np] = orig_np[~hard_mask_np]
+            final_img = Image.fromarray(final_np)
 
             final_img.resize((256, 256)).save(os.path.join(args.output_dir, filenames[j]))
 
