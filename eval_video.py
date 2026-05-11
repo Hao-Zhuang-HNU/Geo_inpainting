@@ -19,6 +19,7 @@ import torchvision
 
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 from scipy import linalg
+from scipy.ndimage import binary_dilation
 
 try:
     import cv2
@@ -73,6 +74,30 @@ def psnr_hole(pred: np.ndarray, gt: np.ndarray, mask: np.ndarray) -> float:
 
 
 def ssim_hole_bbox(pred: np.ndarray, gt: np.ndarray, mask: np.ndarray, pad: int = 8) -> float:
+    ys, xs = np.where(mask > 0.5)
+    if len(xs) == 0:
+        return float("nan")
+    y0, y1 = ys.min(), ys.max()
+    x0, x1 = xs.min(), xs.max()
+    y0 = max(0, y0 - pad); y1 = min(pred.shape[0] - 1, y1 + pad)
+    x0 = max(0, x0 - pad); x1 = min(pred.shape[1] - 1, x1 + pad)
+    p = pred[y0:y1+1, x0:x1+1, :]
+    g = gt[y0:y1+1, x0:x1+1, :]
+    return float(structural_similarity(p, g, channel_axis=2, data_range=1.0))
+
+
+def psnr_masked(pred: np.ndarray, gt: np.ndarray, mask: np.ndarray) -> float:
+    m = mask[..., None]
+    denom = float(np.sum(m)) * 3.0
+    if denom < 1e-6:
+        return float("nan")
+    mse = float(np.sum(((pred - gt) ** 2) * m) / denom)
+    if mse <= 1e-12:
+        return 99.0
+    return 10.0 * math.log10(1.0 / mse)
+
+
+def ssim_masked_bbox(pred: np.ndarray, gt: np.ndarray, mask: np.ndarray, pad: int = 8) -> float:
     ys, xs = np.where(mask > 0.5)
     if len(xs) == 0:
         return float("nan")
@@ -550,6 +575,9 @@ def main():
         mask_size = None
         psnr_h = float("nan")
         ssim_h = float("nan")
+        psnr_nonmask_dil30 = float("nan")
+        ssim_nonmask_dil30 = float("nan")
+        nonmask_dil30_ratio = float("nan")
 
         if m is not None and Path(m).exists():
             mask_pil = Image.open(m).convert("L")
@@ -560,6 +588,12 @@ def main():
 
             psnr_h = psnr_hole(pred, gt, mask)
             ssim_h = ssim_hole_bbox(pred, gt, mask)
+            dilated = binary_dilation(mask > 0.5, iterations=30)
+            nonmask_dil30 = np.logical_and(dilated, mask <= 0.5).astype(np.float32)
+            nonmask_dil30_ratio = float(nonmask_dil30.mean())
+
+            psnr_nonmask_dil30 = psnr_masked(pred, gt, nonmask_dil30)
+            ssim_nonmask_dil30 = ssim_masked_bbox(pred, gt, nonmask_dil30)
 
             psnr_hole_list.append(psnr_h)
             ssim_hole_list.append(ssim_h)
@@ -604,6 +638,9 @@ def main():
                 "SSIM_all": ssim_all,
                 "SSIM_hole": ssim_h,
                 "LPIPS": lpips_val,
+                "nonmask_dil30_ratio": nonmask_dil30_ratio,
+                "PSNR_nonmask_dil30": psnr_nonmask_dil30,
+                "SSIM_nonmask_dil30": ssim_nonmask_dil30,
 
                 "hole_psnr_gt_all": (
                     bool(psnr_h > psnr_all)
@@ -722,6 +759,25 @@ def main():
                 f.write(f"mask_ratio_mean: {float(np.mean(valid_ratios)):.6f}\n")
                 f.write(f"mask_ratio_min : {float(np.min(valid_ratios)):.6f}\n")
                 f.write(f"mask_ratio_max : {float(np.max(valid_ratios)):.6f}\n")
+
+            valid_nonmask_dil30_psnr = [
+                x["PSNR_nonmask_dil30"] for x in debug_records
+                if x["PSNR_nonmask_dil30"] == x["PSNR_nonmask_dil30"]
+            ]
+            valid_nonmask_dil30_ssim = [
+                x["SSIM_nonmask_dil30"] for x in debug_records
+                if x["SSIM_nonmask_dil30"] == x["SSIM_nonmask_dil30"]
+            ]
+            valid_nonmask_dil30_ratio = [
+                x["nonmask_dil30_ratio"] for x in debug_records
+                if x["nonmask_dil30_ratio"] == x["nonmask_dil30_ratio"]
+            ]
+            if len(valid_nonmask_dil30_ratio) > 0:
+                f.write(f"nonmask_dil30_ratio_mean: {float(np.mean(valid_nonmask_dil30_ratio)):.6f}\n")
+            if len(valid_nonmask_dil30_psnr) > 0:
+                f.write(f"PSNR_nonmask_dil30_mean: {float(np.mean(valid_nonmask_dil30_psnr)):.6f}\n")
+            if len(valid_nonmask_dil30_ssim) > 0:
+                f.write(f"SSIM_nonmask_dil30_mean: {float(np.mean(valid_nonmask_dil30_ssim)):.6f}\n")
 
             f.write("\nPotential reasons why PSNR_hole > PSNR_all:\n")
             f.write("1. mask区域很小，且恰好容易恢复，而非mask区域误差更大。\n")
