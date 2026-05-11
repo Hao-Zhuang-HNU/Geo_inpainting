@@ -32,6 +32,8 @@ def parse_args():
     parser.add_argument('--gpu_id', type=int, default=0)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--ip_scale', type=float, default=0.7) 
+    parser.add_argument('--preserve_non_mask_gt', action='store_true',
+                        help='If enabled, copy GT pixels directly outside mask so only masked region is modified')
     return parser.parse_args()
 
 def load_file_list(path):
@@ -172,17 +174,24 @@ def main():
             eroded_mask_np = cv2.erode(mask_np, kernel_erode, iterations=1)
             soft_mask_pil = Image.fromarray(eroded_mask_np).filter(ImageFilter.GaussianBlur(radius=10))
 
-            # 回退到原始 PIL 融合流程（更稳定），并额外强制 mask 外像素保持原图
+            # 回退到原始 PIL 融合流程（更稳定）
             blended = Image.composite(gen_textured_pil, orig_img_pil, soft_mask_pil)
-            final_img = Image.composite(blended, orig_img_pil, ImageOps.invert(mask_pil))
+            final_img = blended
 
-            # 仅在原始 mask 内保留融合结果，彻底消除 mask 外边缘阴影
-            final_np = np.array(final_img)
-            hard_mask_np = (mask_np > 127)
-            final_np[~hard_mask_np] = orig_np[~hard_mask_np]
-            final_img = Image.fromarray(final_np)
+            if args.preserve_non_mask_gt:
+                # 严格模式：非 mask 区域直接来自 GT，不使用软融合，避免任何外溢模糊
+                output_size = (256, 256)
+                gen_out_np = np.array(gen_textured_pil.resize(output_size, Image.Resampling.BICUBIC))
+                orig_out_np = np.array(orig_img_pil.resize(output_size, Image.Resampling.BICUBIC))
+                mask_out_np = np.array(mask_pil.resize(output_size, Image.Resampling.NEAREST))
+                hard_mask_np = (mask_out_np > 127)
+                final_np = orig_out_np.copy()
+                final_np[hard_mask_np] = gen_out_np[hard_mask_np]
+                final_img = Image.fromarray(final_np)
+            else:
+                final_img = final_img.resize((256, 256), Image.Resampling.BICUBIC)
 
-            final_img.resize((256, 256)).save(os.path.join(args.output_dir, filenames[j]))
+            final_img.save(os.path.join(args.output_dir, filenames[j]))
 
     print(f"Inpainting Done. Mode: {'Full' if use_line_guidance else 'Ablation (No Line)'}")
 
