@@ -179,6 +179,7 @@ def main():
             final_img = blended
 
             if args.preserve_non_mask_gt:
+<<<<<<< codex/add-feature-to-preserve-non-mask-region-lmzy9w
                 # 严格模式：非 mask 区域直接来自 GT，不使用软融合，避免任何外溢模糊
                 output_size = (256, 256)
                 gen_out_np = np.array(gen_textured_pil.resize(output_size, Image.Resampling.BICUBIC))
@@ -187,6 +188,15 @@ def main():
                 hard_mask_np = (mask_out_np > 127)
                 final_np = orig_out_np.copy()
                 final_np[hard_mask_np] = gen_out_np[hard_mask_np]
+=======
+                # 启用后严格保证非 mask 区域与 GT 完全一致（在输出分辨率执行，避免 resize 引入边界污染）
+                output_size = (256, 256)
+                final_np = np.array(final_img.resize(output_size, Image.Resampling.BICUBIC))
+                orig_out_np = np.array(orig_img_pil.resize(output_size, Image.Resampling.BICUBIC))
+                mask_out_np = np.array(mask_pil.resize(output_size, Image.Resampling.NEAREST))
+                hard_mask_np = (mask_out_np > 127)
+                final_np[~hard_mask_np] = orig_out_np[~hard_mask_np]
+>>>>>>> Animate_test
                 final_img = Image.fromarray(final_np)
             else:
                 final_img = final_img.resize((256, 256), Image.Resampling.BICUBIC)
