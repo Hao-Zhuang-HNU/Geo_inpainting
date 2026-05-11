@@ -432,6 +432,8 @@ def main():
     parser.add_argument("--out", type=str, default="metrics_out")
     parser.add_argument("--debug", action="store_true",
                         help="输出 pred/gt/mask 对齐关系、尺寸、mask 占比、逐帧指标等调试信息")
+    parser.add_argument("--debug_frame", type=int, default=-1,
+                        help="若>=0，在debug模式下输出该eval_index帧的SSIM分布热力图")
     parser.add_argument("--jump_image", type=int, default=0,
                         help="跳过前N张pred/gt图像。例：--jump_image 1 表示 pred[1]/gt[1] <-> mask[0]")
     parser.add_argument("--jump_mask", type=int, default=0,
@@ -567,6 +569,29 @@ def main():
 
         psnr_all = float(peak_signal_noise_ratio(gt, pred, data_range=1.0))
         ssim_all = float(structural_similarity(gt, pred, channel_axis=2, data_range=1.0))
+
+        if args.debug and args.debug_frame >= 0 and idx == args.debug_frame:
+            # SSIM distribution map: convert to gray to get a 2D per-pixel map.
+            pred_gray = np.mean(pred, axis=2).astype(np.float32)
+            gt_gray = np.mean(gt, axis=2).astype(np.float32)
+            _, ssim_map = structural_similarity(
+                gt_gray, pred_gray, data_range=1.0, full=True
+            )
+            ssim_map = np.asarray(ssim_map, dtype=np.float32)
+            ssim_map = np.clip(ssim_map, -1.0, 1.0)
+
+            # Save raw map for precise analysis
+            np.save(out_dir / f"debug_ssim_map_frame_{idx:04d}.npy", ssim_map)
+
+            # Save colored heatmap PNG
+            if cv2 is not None:
+                ssim_u8 = ((ssim_map + 1.0) * 0.5 * 255.0).astype(np.uint8)
+                heat = cv2.applyColorMap(ssim_u8, cv2.COLORMAP_JET)
+                cv2.imwrite(str(out_dir / f"debug_ssim_heatmap_frame_{idx:04d}.png"), heat)
+            else:
+                # fallback: grayscale image if opencv is unavailable
+                ssim_u8 = ((ssim_map + 1.0) * 0.5 * 255.0).astype(np.uint8)
+                Image.fromarray(ssim_u8, mode="L").save(out_dir / f"debug_ssim_heatmap_frame_{idx:04d}.png")
 
         psnr_all_list.append(psnr_all)
         ssim_all_list.append(ssim_all)
@@ -778,6 +803,13 @@ def main():
                 f.write(f"PSNR_nonmask_dil30_mean: {float(np.mean(valid_nonmask_dil30_psnr)):.6f}\n")
             if len(valid_nonmask_dil30_ssim) > 0:
                 f.write(f"SSIM_nonmask_dil30_mean: {float(np.mean(valid_nonmask_dil30_ssim)):.6f}\n")
+<<<<<<< codex/add-psnr-and-ssim-evaluation-for-non-mask-area-tcgkc5
+            if args.debug_frame >= 0:
+                f.write(f"debug_frame: {args.debug_frame}\n")
+                f.write(f"debug_ssim_map_npy: debug_ssim_map_frame_{args.debug_frame:04d}.npy\n")
+                f.write(f"debug_ssim_heatmap_png: debug_ssim_heatmap_frame_{args.debug_frame:04d}.png\n")
+=======
+>>>>>>> Animate_test
 
             f.write("\nPotential reasons why PSNR_hole > PSNR_all:\n")
             f.write("1. mask区域很小，且恰好容易恢复，而非mask区域误差更大。\n")
