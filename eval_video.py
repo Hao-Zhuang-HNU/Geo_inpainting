@@ -803,10 +803,13 @@ def main():
                 f.write(f"PSNR_nonmask_dil30_mean: {float(np.mean(valid_nonmask_dil30_psnr)):.6f}\n")
             if len(valid_nonmask_dil30_ssim) > 0:
                 f.write(f"SSIM_nonmask_dil30_mean: {float(np.mean(valid_nonmask_dil30_ssim)):.6f}\n")
+<<<<<<< codex/add-psnr-and-ssim-evaluation-for-non-mask-area-tcgkc5
             if args.debug_frame >= 0:
                 f.write(f"debug_frame: {args.debug_frame}\n")
                 f.write(f"debug_ssim_map_npy: debug_ssim_map_frame_{args.debug_frame:04d}.npy\n")
                 f.write(f"debug_ssim_heatmap_png: debug_ssim_heatmap_frame_{args.debug_frame:04d}.png\n")
+=======
+>>>>>>> Animate_test
 
             f.write("\nPotential reasons why PSNR_hole > PSNR_all:\n")
             f.write("1. mask区域很小，且恰好容易恢复，而非mask区域误差更大。\n")
