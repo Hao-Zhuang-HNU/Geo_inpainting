@@ -1,30 +1,29 @@
-##屏蔽目录
+##output directory
 tsr_output/
-eval_out_video/
-eval_out_line/
+eval_line/
+eval_video/
 results/
-tb_logs/
-test_list/
+gt_line/
+
+##list
 DL3DV_testlist/
 ScannetPP_testlist/
 MVImgNet_testlist/
 data_list/
-debug_test/
-debug_line/
-ckpt/
-1e1a_flow_test/
 filter_results/
+
+##pth
+ckpt/
 gt_line/
-line_postprocess_output/
-##屏蔽特定类型文件
+weights/
+video_logs/
+tb_logs/
+experiments_model/
+
+
+## IDE config
 .ipynb_checkpoints/
-##屏蔽IDE配置文件
 .vscode/
 __pycache__/
-src/__pycache__/
-src/models/__pycache__/
-datasets/__pycache__/
-scripts/__pycache__/
-##屏蔽依赖目录
 
 
