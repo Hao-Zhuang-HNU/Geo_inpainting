@@ -1,7 +1,10 @@
 ##output directory
 tsr_output/
+geo_output/
 eval_line/
+eval_line_cheating/
 eval_video/
+eval_video_cheating/
 results/
 gt_line/
 
@@ -9,6 +12,7 @@ gt_line/
 DL3DV_testlist/
 ScannetPP_testlist/
 MVImgNet_testlist/
+BundleFusion_testlist/
 data_list/
 filter_results/
 
