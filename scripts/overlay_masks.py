@@ -2,196 +2,289 @@
 # -*- coding: utf-8 -*-
 
 """
-Overlay masks on RGB images by list files.
+Overlay/fill masks on images using natural-order matching.
 
-Usage:
-  python overlay_masks.py \
-      --images_list .txt \
-      --masks_list .txt \
-      --output_path /abs/path/to/output_path \
-      --color "#FFFFF" \
-      --alpha 1 \
-      --mask_threshold 128
+Default behavior keeps the original visualization style:
+    mask region -> transparent green overlay with alpha=0.3
 
-Notes:
-- images_list.txt 与 masks_list.txt 每行一个绝对路径，支持常见图像格式（png/jpg/webp等）。
-- 若 mask 为三通道，会自动转灰度用于阈值判断；非零或高于阈值的像素作为覆盖区域。
-- 叠加颜色用十六进制或 "R,G,B"（如 "0,255,0"）均可。
+If you need images for previous --image_url experiments where masked regions
+are covered by opaque white, explicitly pass --mode white.
+
+Examples:
+    # Default: transparent green visualization, alpha=0.3
+    python overlay_masks_white.py \
+        --imgs ./images \
+        --masks ./masks \
+        -o ./vis_green
+
+    # Opaque white images for --image_url inference input:
+    python overlay_masks_white.py \
+        --imgs ./images \
+        --masks ./masks \
+        -o ./masked_white_imgs \
+        --mode white \
+        --save_list ./masked_white_imgs.txt
 """
 
 import argparse
-import os
-import sys
-from typing import List, Tuple
+import re
+from pathlib import Path
 
+import cv2
 import numpy as np
-from PIL import Image
 
 
-def read_list_file(list_path: str) -> List[str]:
-    if not os.path.isfile(list_path):
-        raise FileNotFoundError(f"List file not found: {list_path}")
-    with open(list_path, "r", encoding="utf-8") as f:
-        lines = [ln.strip() for ln in f if ln.strip()]
-    # 过滤不存在的文件并给出提示
-    paths = []
-    for p in lines:
-        if os.path.isfile(p):
-            paths.append(p)
-        else:
-            print(f"[WARN] File not found (skip): {p}", file=sys.stderr)
-    if not paths:
-        raise ValueError(f"No valid paths found in {list_path}")
-    return paths
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 
 
-def parse_color(color_str: str) -> Tuple[int, int, int]:
-    """支持 '#RRGGBB' 或 'R,G,B' 两种格式"""
-    color_str = color_str.strip()
-    if color_str.startswith("#"):
-        hexstr = color_str.lstrip("#")
-        if len(hexstr) != 6:
-            raise ValueError(f"Invalid hex color: {color_str}")
-        r = int(hexstr[0:2], 16)
-        g = int(hexstr[2:4], 16)
-        b = int(hexstr[4:6], 16)
-        return (r, g, b)
-    else:
-        try:
-            parts = [int(x) for x in color_str.split(",")]
-            assert len(parts) == 3
-            for v in parts:
-                if not (0 <= v <= 255):
-                    raise ValueError
-            return tuple(parts)  # type: ignore
-        except Exception:
-            raise ValueError(f"Invalid color format: {color_str}. Use '#RRGGBB' or 'R,G,B'.")
-
-
-def load_image_as_rgb(path: str) -> Image.Image:
-    img = Image.open(path).convert("RGB")
-    return img
-
-
-def load_mask_as_gray(path: str, size: Tuple[int, int]) -> Image.Image:
+def natural_key(path: Path):
     """
-    将 mask 读为灰度图并缩放到目标 size (W,H)。
-    支持单通道或三通道 mask；三通道会转灰度用于阈值。
+    Natural order:
+        frame_2.png < frame_10.png
     """
-    m = Image.open(path)
-    if m.mode not in ("L", "I;16", "I", "F"):
-        m = m.convert("L")
-    # resize 到与 RGB 一致
-    if m.size != size:
-        m = m.resize(size, resample=Image.NEAREST)
-    return m
+    name = path.as_posix()
+    return [
+        int(text) if text.isdigit() else text.lower()
+        for text in re.split(r"(\d+)", name)
+    ]
 
 
-def overlay_mask_on_rgb(
-    rgb_img: Image.Image,
-    mask_gray: Image.Image,
-    color: Tuple[int, int, int],
-    alpha: float,
-    mask_threshold: int,
-) -> Image.Image:
+def list_images(folder: Path):
+    files = [
+        p for p in folder.rglob("*")
+        if p.is_file() and p.suffix.lower() in IMG_EXTS
+    ]
+    return sorted(files, key=natural_key)
+
+
+def load_mask(mask_path: Path, target_hw, threshold=127):
     """
-    在 rgb_img 上用给定 color/alpha 叠加 mask_gray>threshold 的区域。
-    返回新的 RGB 图像。
+    Read mask and convert it to bool mask.
+    Pixels larger than threshold are treated as occluded regions.
     """
-    # 转 numpy
-    rgb_np = np.asarray(rgb_img, dtype=np.uint8)
-    if mask_gray.mode != "L":
-        mask_gray = mask_gray.convert("L")
-    mask_np = np.asarray(mask_gray, dtype=np.uint8)
+    mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
+    if mask is None:
+        raise RuntimeError(f"Failed to read mask: {mask_path}")
 
-    # 生成二值mask：> threshold 的位置为 True
-    m = mask_np > mask_threshold  # shape: (H, W), bool
+    if mask.ndim == 3:
+        # RGB/RGBA mask -> grayscale.
+        if mask.shape[2] == 4:
+            mask = mask[:, :, :3]
+        mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
 
-    if not m.any():
-        # 没有覆盖区域，直接返回拷贝
-        return rgb_img.copy()
+    h, w = target_hw
+    if mask.shape[:2] != (h, w):
+        mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
 
-    # 叠加层
-    overlay = np.zeros_like(rgb_np, dtype=np.float32)
-    overlay[..., 0] = color[0]
-    overlay[..., 1] = color[1]
-    overlay[..., 2] = color[2]
+    return mask > threshold
 
-    out = rgb_np.astype(np.float32)
-    # 仅在 m 区域内做 alpha 混合： out = (1-a)*rgb + a*color
-    a = float(np.clip(alpha, 0.0, 1.0))
-    # 扩展 mask 到三通道
-    m3 = np.stack([m, m, m], axis=-1)
 
-    out[m3] = (1.0 - a) * out[m3] + a * overlay[m3]
+def fill_mask(img, mask_bool, fill_value=255):
+    """
+    Fill mask region with an opaque constant value.
+    For white opaque mask, fill_value=255.
+    """
+    out = img.copy()
+    fill_value = int(np.clip(fill_value, 0, 255))
+    out[mask_bool] = (fill_value, fill_value, fill_value)
+    return out
 
-    out = np.clip(out + 0.5, 0, 255).astype(np.uint8)
-    return Image.fromarray(out, mode="RGB")
+
+def overlay_green(img, mask_bool, alpha=0.3):
+    """
+    Overlay transparent green on mask region for visualization.
+    OpenCV uses BGR, so green is (0, 255, 0).
+    """
+    out = img.copy()
+
+    green = np.zeros_like(img, dtype=np.uint8)
+    green[:, :] = (0, 255, 0)
+
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    blended = cv2.addWeighted(img, 1.0 - alpha, green, alpha, 0)
+
+    out[mask_bool] = blended[mask_bool]
+    return out
+
+
+def make_output_path(img_path: Path, img_root: Path, out_root: Path):
+    """
+    Preserve the relative directory structure to avoid overwriting files
+    with the same basename from different subfolders.
+    """
+    rel = img_path.relative_to(img_root)
+    out_path = out_root / rel
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    return out_path
+
+
+def write_list(list_path: Path, paths):
+    list_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(list_path, "w", encoding="utf-8") as f:
+        for p in paths:
+            f.write(str(p.resolve()) + "\n")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Overlay masks on RGB images by list files.")
-    parser.add_argument("--images_list", required=True, help="Text file: absolute paths of RGB images, one per line.")
-    parser.add_argument("--masks_list", required=True, help="Text file: absolute paths of mask images, one per line.")
-    parser.add_argument("--output_path", required=True, help="Directory to save overlaid images.")
-    parser.add_argument("--color", default="#FFFFFF", help="Overlay color. '#FFFFFF' or #000000'")
-    parser.add_argument("--alpha", type=float, default=1, help="Overlay transparency in [0,1]. Default 1.")
-    parser.add_argument("--mask_threshold", type=int, default=128, help="Threshold (0-255). >threshold means masked.")
-    parser.add_argument("--suffix", default="", help="Suffix for output filename. Default ''.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Apply masks to images using natural-order matching. "
+            "Default mode overlays transparent green mask visualization with alpha=0.3."
+        )
+    )
+    parser.add_argument(
+        "--imgs",
+        required=True,
+        type=str,
+        help="Input image directory."
+    )
+    parser.add_argument(
+        "--masks",
+        required=True,
+        type=str,
+        help="Input mask directory."
+    )
+    parser.add_argument(
+        "-o", "--output",
+        required=True,
+        type=str,
+        help="Output directory."
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["white", "fill", "green"],
+        default="green",
+        help=(
+            "green: transparent green visualization; "
+            "white/fill: fill mask region with an opaque constant value. Default: green"
+        )
+    )
+    parser.add_argument(
+        "--fill_value",
+        type=int,
+        default=255,
+        help="Fill value for --mode white/fill. 255 means pure white. Default: 255"
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=0.3,
+        help="Mask overlay transparency for --mode green. Default: 0.3"
+    )
+    parser.add_argument(
+        "--mask_threshold",
+        type=int,
+        default=127,
+        help="Mask binarization threshold. Pixels > threshold are treated as mask. Default: 127"
+    )
+    parser.add_argument(
+        "--repeat_masks",
+        action="store_true",
+        help=(
+            "If mask count is smaller than image count, reuse masks cyclically: "
+            "image[i] <-> mask[i % len(masks)]."
+        )
+    )
+    parser.add_argument(
+        "--save_list",
+        type=str,
+        default="",
+        help=(
+            "Optional path to save an absolute-path txt list of generated images. "
+            "This list can be used directly as --image_url."
+        )
+    )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Compatibility argument. The script always searches recursively."
+    )
+
     args = parser.parse_args()
 
-    rgb_paths = read_list_file(args.images_list)
-    mask_paths = read_list_file(args.masks_list)
+    img_dir = Path(args.imgs)
+    mask_dir = Path(args.masks)
+    out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    os.makedirs(args.output_path, exist_ok=True)
-    color = parse_color(args.color)
-    alpha = float(np.clip(args.alpha, 0.0, 1.0))
-    thr = int(np.clip(args.mask_threshold, 0, 255))
+    if not img_dir.exists():
+        raise FileNotFoundError(f"Image directory not found: {img_dir}")
+    if not mask_dir.exists():
+        raise FileNotFoundError(f"Mask directory not found: {mask_dir}")
 
-    n_rgb = len(rgb_paths)
-    n_mask = len(mask_paths)
+    img_paths = list_images(img_dir)
+    mask_paths = list_images(mask_dir)
 
-    print(f"[INFO] RGB images: {n_rgb}, masks: {n_mask}")
-    if n_mask == 0:
-        print("[ERROR] No valid masks.", file=sys.stderr)
-        sys.exit(2)
+    if len(img_paths) == 0:
+        raise RuntimeError(f"No images found in: {img_dir}")
+    if len(mask_paths) == 0:
+        raise RuntimeError(f"No masks found in: {mask_dir}")
 
-    used_mask_count = 0
-    for i, rgb_p in enumerate(rgb_paths):
-        try:
-            rgb = load_image_as_rgb(rgb_p)
-        except Exception as e:
-            print(f"[ERROR] Failed to read RGB: {rgb_p} | {e}", file=sys.stderr)
+    if args.repeat_masks:
+        n = len(img_paths)
+        print(
+            f"[INFO] repeat_masks=True. Processing all {n} images with "
+            f"{len(mask_paths)} masks cyclically."
+        )
+    else:
+        n = min(len(img_paths), len(mask_paths))
+        if len(img_paths) != len(mask_paths):
+            print(
+                f"[WARN] Image count != mask count: "
+                f"{len(img_paths)} images vs {len(mask_paths)} masks. "
+                f"Only processing first {n} pairs. "
+                f"Use --repeat_masks to process all images cyclically."
+            )
+
+    print(f"[INFO] Found {len(img_paths)} images.")
+    print(f"[INFO] Found {len(mask_paths)} masks.")
+    print(f"[INFO] Processing {n} pairs.")
+    print(f"[INFO] Mode = {args.mode}")
+
+    if args.mode in ("white", "fill"):
+        print(f"[INFO] Fill value = {args.fill_value}")
+    else:
+        print(f"[INFO] Alpha = {args.alpha}")
+
+    written_paths = []
+
+    for i in range(n):
+        img_path = img_paths[i]
+        mask_path = mask_paths[i % len(mask_paths)] if args.repeat_masks else mask_paths[i]
+
+        img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+        if img is None:
+            print(f"[WARN] Failed to read image, skip: {img_path}")
             continue
 
-        # 选择 mask：若不足则循环复用；若更多则自然会有未使用的（被舍弃）
-        mi = i % n_mask
-        mask_p = mask_paths[mi]
-        try:
-            mask = load_mask_as_gray(mask_p, size=rgb.size)  # PIL size is (W, H)
-        except Exception as e:
-            print(f"[ERROR] Failed to read/resize mask: {mask_p} | {e}", file=sys.stderr)
+        h, w = img.shape[:2]
+        mask_bool = load_mask(mask_path, target_hw=(h, w), threshold=args.mask_threshold)
+
+        if args.mode in ("white", "fill"):
+            out = fill_mask(img, mask_bool, fill_value=args.fill_value)
+        else:
+            out = overlay_green(img, mask_bool, alpha=args.alpha)
+
+        out_path = make_output_path(img_path, img_dir, out_dir)
+        ok = cv2.imwrite(str(out_path), out)
+        if not ok:
+            print(f"[WARN] Failed to write output: {out_path}")
             continue
 
-        out_img = overlay_mask_on_rgb(rgb, mask, color=color, alpha=alpha, mask_threshold=thr)
+        written_paths.append(out_path)
 
-        base = os.path.basename(rgb_p)
-        stem, ext = os.path.splitext(base)
-        out_name = f"{stem}{args.suffix}{ext if ext else '.png'}"
-        out_path = os.path.join(args.output_path, out_name)
-        try:
-            out_img.save(out_path)
-            used_mask_count += 1 if mi < n_mask else 0
-            print(f"[OK] {i+1}/{n_rgb} -> {out_path}  (mask: {os.path.basename(mask_p)})")
-        except Exception as e:
-            print(f"[ERROR] Failed to save: {out_path} | {e}", file=sys.stderr)
+        print(
+            f"[{i:05d}] "
+            f"img={img_path.name}  "
+            f"mask={mask_path.name}  "
+            f"-> {out_path.relative_to(out_dir)}"
+        )
 
-    # 提示是否有 mask 未被使用（当 mask 多于 rgb）
-    if n_mask > n_rgb:
-        unused = n_mask - n_rgb
-        print(f"[INFO] {unused} masks were not used (more masks than RGBs).")
+    if args.save_list:
+        write_list(Path(args.save_list), written_paths)
+        print(f"[INFO] Saved generated image list: {Path(args.save_list).resolve()}")
 
-    print("[DONE] All processed.")
+    print(f"[DONE] Wrote {len(written_paths)} images to: {out_dir.resolve()}")
 
 
 if __name__ == "__main__":

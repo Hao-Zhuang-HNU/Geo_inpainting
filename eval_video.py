@@ -110,6 +110,25 @@ def ssim_masked_bbox(pred: np.ndarray, gt: np.ndarray, mask: np.ndarray, pad: in
     return float(structural_similarity(p, g, channel_axis=2, data_range=1.0))
 
 
+def ssim_masked_map(pred: np.ndarray, gt: np.ndarray, mask: np.ndarray) -> float:
+    """
+    Compute SSIM on a selected region by averaging the full-image SSIM map.
+    mask: HW, 1=region to evaluate.
+    """
+    m = mask.astype(np.float32)
+    denom = float(np.sum(m))
+    if denom < 1e-6:
+        return float("nan")
+
+    _, ssim_map = structural_similarity(
+        gt, pred, channel_axis=2, data_range=1.0, full=True
+    )
+    ssim_map = np.asarray(ssim_map, dtype=np.float32)
+    if ssim_map.ndim == 3:
+        ssim_map = np.mean(ssim_map, axis=2)
+    return float(np.sum(ssim_map * m) / denom)
+
+
 # ----------------------- LPIPS -----------------------
 class LPIPSMetric:
     def __init__(self, device: torch.device, net: str = "alex"):
@@ -552,8 +571,8 @@ def main():
         print("[WARN] lpips not installed; LPIPS/tLPIPS will be skipped.")
 
     # Frame metrics
-    psnr_all_list, psnr_hole_list = [], []
-    ssim_all_list, ssim_hole_list = [], []
+    psnr_all_list, psnr_hole_list, psnr_nomask_list = [], [], []
+    ssim_all_list, ssim_hole_list, ssim_nomask_list = [], [], []
     lpips_list = []
     debug_records = []
 
@@ -600,6 +619,8 @@ def main():
         mask_size = None
         psnr_h = float("nan")
         ssim_h = float("nan")
+        psnr_nomask = float("nan")
+        ssim_nomask = float("nan")
         psnr_nonmask_dil30 = float("nan")
         ssim_nonmask_dil30 = float("nan")
         nonmask_dil30_ratio = float("nan")
@@ -613,6 +634,13 @@ def main():
 
             psnr_h = psnr_hole(pred, gt, mask)
             ssim_h = ssim_hole_bbox(pred, gt, mask)
+
+            # Non-mask metrics: evaluate whether inpainting changes the unmasked region.
+            # mask: 1=hole, so nomask: 1=known / unmasked pixels.
+            nomask = (mask <= 0.5).astype(np.float32)
+            psnr_nomask = psnr_masked(pred, gt, nomask)
+            ssim_nomask = ssim_masked_map(pred, gt, nomask)
+
             dilated = binary_dilation(mask > 0.5, iterations=30)
             nonmask_dil30 = np.logical_and(dilated, mask <= 0.5).astype(np.float32)
             nonmask_dil30_ratio = float(nonmask_dil30.mean())
@@ -622,9 +650,13 @@ def main():
 
             psnr_hole_list.append(psnr_h)
             ssim_hole_list.append(ssim_h)
+            psnr_nomask_list.append(psnr_nomask)
+            ssim_nomask_list.append(ssim_nomask)
         else:
             psnr_hole_list.append(float("nan"))
             ssim_hole_list.append(float("nan"))
+            psnr_nomask_list.append(float("nan"))
+            ssim_nomask_list.append(float("nan"))
 
         lpips_val = float("nan")
         if lpips_metric is not None:
@@ -662,6 +694,8 @@ def main():
                 "PSNR_hole": psnr_h,
                 "SSIM_all": ssim_all,
                 "SSIM_hole": ssim_h,
+                "PSNR_nomask": psnr_nomask,
+                "SSIM_nomask": ssim_nomask,
                 "LPIPS": lpips_val,
                 "nonmask_dil30_ratio": nonmask_dil30_ratio,
                 "PSNR_nonmask_dil30": psnr_nonmask_dil30,
@@ -713,6 +747,8 @@ def main():
         "PSNR_hole": float(np.nanmean(psnr_hole_list)),
         "SSIM_all": float(np.nanmean(ssim_all_list)),
         "SSIM_hole": float(np.nanmean(ssim_hole_list)),
+        "PSNR_nomask": float(np.nanmean(psnr_nomask_list)),
+        "SSIM_nomask": float(np.nanmean(ssim_nomask_list)),
         "LPIPS": float(np.nanmean(lpips_list)) if len(lpips_list) else float("nan"),
         "FID": float(fid),
         "VFID_proxy": float(vfid),
@@ -785,6 +821,19 @@ def main():
                 f.write(f"mask_ratio_min : {float(np.min(valid_ratios)):.6f}\n")
                 f.write(f"mask_ratio_max : {float(np.max(valid_ratios)):.6f}\n")
 
+            valid_nomask_psnr = [
+                x["PSNR_nomask"] for x in debug_records
+                if x["PSNR_nomask"] == x["PSNR_nomask"]
+            ]
+            valid_nomask_ssim = [
+                x["SSIM_nomask"] for x in debug_records
+                if x["SSIM_nomask"] == x["SSIM_nomask"]
+            ]
+            if len(valid_nomask_psnr) > 0:
+                f.write(f"PSNR_nomask_mean: {float(np.mean(valid_nomask_psnr)):.6f}\n")
+            if len(valid_nomask_ssim) > 0:
+                f.write(f"SSIM_nomask_mean: {float(np.mean(valid_nomask_ssim)):.6f}\n")
+
             valid_nonmask_dil30_psnr = [
                 x["PSNR_nonmask_dil30"] for x in debug_records
                 if x["PSNR_nonmask_dil30"] == x["PSNR_nonmask_dil30"]
@@ -803,13 +852,10 @@ def main():
                 f.write(f"PSNR_nonmask_dil30_mean: {float(np.mean(valid_nonmask_dil30_psnr)):.6f}\n")
             if len(valid_nonmask_dil30_ssim) > 0:
                 f.write(f"SSIM_nonmask_dil30_mean: {float(np.mean(valid_nonmask_dil30_ssim)):.6f}\n")
-<<<<<<< codex/add-psnr-and-ssim-evaluation-for-non-mask-area-tcgkc5
             if args.debug_frame >= 0:
                 f.write(f"debug_frame: {args.debug_frame}\n")
                 f.write(f"debug_ssim_map_npy: debug_ssim_map_frame_{args.debug_frame:04d}.npy\n")
                 f.write(f"debug_ssim_heatmap_png: debug_ssim_heatmap_frame_{args.debug_frame:04d}.png\n")
-=======
->>>>>>> Animate_test
 
             f.write("\nPotential reasons why PSNR_hole > PSNR_all:\n")
             f.write("1. mask区域很小，且恰好容易恢复，而非mask区域误差更大。\n")

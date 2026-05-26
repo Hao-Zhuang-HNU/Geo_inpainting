@@ -1,0 +1,10 @@
+python lsm_hawp_inference_acceration.py -i /root/autodl-tmp/Inpainting/DL3DV/D_fault/D_imgs_5_10/ -o /root/autodl-tmp/Inpainting/DL3DV/D_fault/D_pkls_5_10/
+python lsm_hawp_inference_acceration.py -i /root/autodl-tmp/Inpainting/DL3DV/D_fault/D_imgs_10_20/ -o /root/autodl-tmp/Inpainting/DL3DV/D_fault/D_pkls_10_20/
+python lsm_hawp_inference_acceration.py -i /root/autodl-tmp/Inpainting/DL3DV/D_fault/D_imgs_20_30/ -o /root/autodl-tmp/Inpainting/DL3DV/D_fault/D_pkls_20_30/
+python lsm_hawp_inference_acceration.py -i /root/autodl-tmp/Inpainting/DL3DV/D_fault/D_imgs_30_40/ -o /root/autodl-tmp/Inpainting/DL3DV/D_fault/D_pkls_30_40/
+python lsm_hawp_inference_acceration.py -i /root/autodl-tmp/Inpainting/DL3DV/D_fault/D_imgs_40_50/ -o /root/autodl-tmp/Inpainting/DL3DV/D_fault/D_pkls_40_50/
+python lsm_hawp_inference_acceration.py -i /root/autodl-tmp/Inpainting/ScannetPP/S_fault/S_imgs_5_10/ -o /root/autodl-tmp/Inpainting/ScannetPP/S_fault/S_pkls_5_10/
+python lsm_hawp_inference_acceration.py -i /root/autodl-tmp/Inpainting/ScannetPP/S_fault/S_imgs_10_20/ -o /root/autodl-tmp/Inpainting/ScannetPP/S_fault/S_pkls_10_20/
+python lsm_hawp_inference_acceration.py -i /root/autodl-tmp/Inpainting/ScannetPP/S_fault/S_imgs_20_30/ -o /root/autodl-tmp/Inpainting/ScannetPP/S_fault/S_pkls_20_30/
+python lsm_hawp_inference_acceration.py -i /root/autodl-tmp/Inpainting/ScannetPP/S_fault/S_imgs_30_40/ -o /root/autodl-tmp/Inpainting/ScannetPP/S_fault/S_pkls_30_40/
+python lsm_hawp_inference_acceration.py -i /root/autodl-tmp/Inpainting/ScannetPP/S_fault/S_imgs_40_50/ -o /root/autodl-tmp/Inpainting/ScannetPP/S_fault/S_pkls_40_50/

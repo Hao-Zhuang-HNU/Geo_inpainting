@@ -64,8 +64,8 @@ def get_image_files(input_path):
 
 def main():
     parser = argparse.ArgumentParser(description="ScanNet++ 全图缩放脚本 (不裁剪，保留视野)")
-    parser.add_argument('--input_path', type=str, required=True, help="ScanNet++ 处理后的根目录")
-    parser.add_argument('--pix', type=int, default=512, help="目标分辨率 (建议 512 用于提取 pkl 和生成 npz)")
+    parser.add_argument('-i', '--input_path', type=str, required=True, help="ScanNet++ 处理后的根目录")
+    parser.add_argument('--pix', type=int, default=256)
     parser.add_argument('--workers', type=int, default=os.cpu_count(), help="进程数")
     args = parser.parse_args()
 
