@@ -17,10 +17,10 @@ from core.lr_scheduler import MultiStepRestartLR, CosineAnnealingRestartLR
 from core.loss import AdversarialLoss, PerceptualLoss, LPIPSLoss
 from core.dataset import TrainDataset
 
-from model.modules.flow_comp_raft import RAFT_bi, FlowLoss, EdgeLoss
-from model.recurrent_flow_completion import RecurrentFlowCompleteNet
+from src.models.modules.flow_comp_raft import RAFT_bi, FlowLoss, EdgeLoss
+from src.models.recurrent_flow_completion import RecurrentFlowCompleteNet
 
-from RAFT.utils.flow_viz_pt import flow_to_image
+from src.RAFT.utils.flow_viz_pt import flow_to_image
 
 
 class Trainer:
@@ -36,6 +36,8 @@ class Trainer:
         if len(self.train_dataset) == 0:
             raise RuntimeError('TrainDataset has 0 valid videos. Please verify video_list/video_root and frame counts.')
         self.use_line_guidance = getattr(self.train_dataset, 'use_line', False)
+        self.line_guidance_weight = float(config.get('line_guidance_weight',
+                                            config.get('model', {}).get('line_guidance_weight', 1.0)))
 
         self.train_sampler = None
         self.train_args = config['trainer']
@@ -84,7 +86,7 @@ class Trainer:
         # self.flow_loss = FlowLoss()
 
         # setup models including generator and discriminator
-        net = importlib.import_module('model.' + config['model']['net'])
+        net = importlib.import_module('src.models.' + config['model']['net'])
         self.netG = net.InpaintGenerator()
         # print(self.netG)
         self.netG = self.netG.to(self.config['device'])
@@ -393,9 +395,14 @@ class Trainer:
         train_data = self.prefetcher.next()
         while train_data is not None:
             self.iteration += 1
-            frames, masks, line_tensors, flows_f, flows_b, _ = train_data
+            if len(train_data) == 7:
+                frames, masks, line_tensors, line_loss_tensors, flows_f, flows_b, _ = train_data
+            else:
+                frames, masks, line_tensors, flows_f, flows_b, _ = train_data
+                line_loss_tensors = line_tensors
             frames, masks = frames.to(device), masks.to(device).float()
             line_tensors = line_tensors.to(device).float()
+            line_loss_tensors = line_loss_tensors.to(device).float()
             l_t = self.num_local_frames
             b, t, c, h, w = frames.size()
             gt_local_frames = frames[:, :l_t, ...]
@@ -425,7 +432,9 @@ class Trainer:
 
             # ---- feature propagation + Transformer ----
             line_guidance = line_tensors if self.use_line_guidance else None
-            pred_imgs = self.netG(updated_frames, pred_flows_bi, masks, updated_masks, l_t, line_guidance=line_guidance)
+            pred_imgs = self.netG(updated_frames, pred_flows_bi, masks, updated_masks, l_t,
+                                  line_guidance=line_guidance,
+                                  line_guidance_weight=self.line_guidance_weight)
             pred_imgs = pred_imgs.view(b, -1, c, h, w)
 
             # get the local frames
@@ -469,7 +478,7 @@ class Trainer:
                 line_alpha = self.config['losses'].get('line_loss_alpha', 3.0)
                 # Dilate sparse line supervision slightly so a 1-pixel pkl line still affects nearby RGB pixels.
                 line_region = F.max_pool2d(
-                    line_tensors.view(-1, 1, h, w), kernel_size=5, stride=1, padding=2
+                    line_loss_tensors.view(-1, 1, h, w), kernel_size=5, stride=1, padding=2
                 ).view(b, t, 1, h, w)
                 line_weight = 1.0 + line_alpha * line_region
                 denom = torch.mean(masks * line_weight).clamp_min(1e-6)
@@ -483,7 +492,7 @@ class Trainer:
             if self.use_line_guidance and sobel_weight > 0:
                 sobel_line_alpha = self.config['losses'].get('sobel_line_alpha', 2.0)
                 line_region = F.max_pool2d(
-                    line_tensors.view(-1, 1, h, w), kernel_size=5, stride=1, padding=2
+                    line_loss_tensors.view(-1, 1, h, w), kernel_size=5, stride=1, padding=2
                 ).view(b, t, 1, h, w)
                 sobel_pred = self._sobel_grad(pred_imgs)
                 sobel_gt = self._sobel_grad(frames)

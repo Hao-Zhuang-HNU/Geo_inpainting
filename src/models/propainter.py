@@ -350,7 +350,8 @@ class InpaintGenerator(BaseNetwork):
         _, _, prop_frames, updated_masks = self.img_prop_module(masked_frames, completed_flows[0], completed_flows[1], masks, interpolation)
         return prop_frames, updated_masks
 
-    def forward(self, masked_frames, completed_flows, masks_in, masks_updated, num_local_frames, line_guidance=None, interpolation='bilinear', t_dilation=2):
+    def forward(self, masked_frames, completed_flows, masks_in, masks_updated, num_local_frames,
+                line_guidance=None, line_guidance_weight=1.0, interpolation='bilinear', t_dilation=2):
         """
         Args:
             masks_in: original mask
@@ -373,7 +374,8 @@ class InpaintGenerator(BaseNetwork):
         # ProPainter behavior before line-guided fine-tuning.
         if line_guidance is not None:
             line_feat = self.line_encoder(line_guidance.view(b * t, 1, ori_h, ori_w).to(dtype=enc_feat.dtype))
-            enc_feat = enc_feat + self.line_fuse(torch.cat([enc_feat, line_feat], dim=1))
+            line_delta = self.line_fuse(torch.cat([enc_feat, line_feat], dim=1))
+            enc_feat = enc_feat + float(line_guidance_weight) * line_delta
         _, c, h, w = enc_feat.size()
         local_feat = enc_feat.view(b, t, c, h, w)[:, :l_t, ...]
         ref_feat = enc_feat.view(b, t, c, h, w)[:, l_t:, ...]

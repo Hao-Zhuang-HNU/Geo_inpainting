@@ -12,6 +12,7 @@ from PIL import Image
 import numpy as np
 
 import torch
+import torch.nn.functional as F
 import torchvision.transforms as transforms
 
 from utils.file_client import FileClient
@@ -256,6 +257,25 @@ class TrainDataset(torch.utils.data.Dataset):
         self.line_width = args.get('line_width', 1)
         self.line_swap_xy = args.get('line_swap_xy', True)
         self.line_invert_y = args.get('line_invert_y', True)
+
+        # Robust line-guidance training options. These simulate the gap between
+        # clean GT/HAWP lines used during training and imperfect Geo-predicted
+        # lines used at inference time. All probabilities default to 0 so the
+        # original training behavior is preserved unless enabled in the config.
+        self.line_train_aug = bool(args.get('line_train_aug', False))
+        self.return_clean_line_for_loss = bool(args.get('return_clean_line_for_loss', self.line_train_aug))
+        self.line_dropout_prob = float(args.get('line_dropout_prob', 0.0))
+        self.line_hole_empty_prob = float(args.get('line_hole_empty_prob', 0.0))
+        self.line_hole_dropout_prob = float(args.get('line_hole_dropout_prob', 0.0))
+        self.line_hole_dropout_keep = float(args.get('line_hole_dropout_keep', 0.7))
+        self.line_shift_prob = float(args.get('line_shift_prob', 0.0))
+        self.line_shift_max = int(args.get('line_shift_max', 2))
+        self.line_dilate_prob = float(args.get('line_dilate_prob', 0.0))
+        self.line_erode_prob = float(args.get('line_erode_prob', 0.0))
+        self.line_morph_kernel = int(args.get('line_morph_kernel', 3))
+        self.line_noise_prob = float(args.get('line_noise_prob', 0.0))
+        self.line_noise_density = float(args.get('line_noise_density', 0.001))
+
         self.num_local_frames = args['num_local_frames']
         self.num_ref_frames = args['num_ref_frames']
         self.size = self.w, self.h = (args['w'], args['h'])
@@ -318,6 +338,85 @@ class TrainDataset(torch.utils.data.Dataset):
         ref_index = sorted(random.sample(remain_idx, num_ref_frame))
 
         return local_idx + ref_index
+
+    @staticmethod
+    def _shift_no_wrap(x, shift_y, shift_x):
+        """Shift [T,C,H,W] tensor without circular wrap-around."""
+        if shift_y == 0 and shift_x == 0:
+            return x
+        out = torch.zeros_like(x)
+        _, _, h, w = x.shape
+        y_src0 = max(0, -shift_y)
+        y_src1 = min(h, h - shift_y)
+        x_src0 = max(0, -shift_x)
+        x_src1 = min(w, w - shift_x)
+        y_dst0 = max(0, shift_y)
+        y_dst1 = min(h, h + shift_y)
+        x_dst0 = max(0, shift_x)
+        x_dst1 = min(w, w + shift_x)
+        if y_src1 > y_src0 and x_src1 > x_src0:
+            out[:, :, y_dst0:y_dst1, x_dst0:x_dst1] = x[:, :, y_src0:y_src1, x_src0:x_src1]
+        return out
+
+    def _augment_line_tensors(self, line_tensors, mask_tensors):
+        """Apply predicted-line robustness augmentation to [T,1,H,W] line maps.
+
+        The augmentation is intentionally mask-aware: outside the hole, line maps
+        are mostly preserved as observed context; inside the hole, lines may be
+        removed, shifted, or corrupted to mimic imperfect structure completion.
+        """
+        if (not self.line_train_aug) or (not self.use_line):
+            return line_tensors
+
+        line = line_tensors.clone()
+        mask = (mask_tensors > 0.5).to(line)
+
+        # Occasionally remove all line guidance. This forces the model to keep a
+        # ProPainter-like fallback instead of overfitting to clean structure.
+        if self.line_dropout_prob > 0 and random.random() < self.line_dropout_prob:
+            return torch.zeros_like(line)
+
+        # Occasionally remove only the predicted/inpainted part of line guidance.
+        if self.line_hole_empty_prob > 0 and random.random() < self.line_hole_empty_prob:
+            line = line * (1.0 - mask)
+
+        # Randomly drop pixels in the hole to simulate broken or low-recall Geo lines.
+        if self.line_hole_dropout_prob > 0 and random.random() < self.line_hole_dropout_prob:
+            keep_prob = min(max(self.line_hole_dropout_keep, 0.0), 1.0)
+            keep = (torch.rand_like(line) < keep_prob).to(line)
+            line = line * ((1.0 - mask) + mask * keep)
+
+        # Small no-wrap shift to simulate line localization errors.
+        if self.line_shift_prob > 0 and self.line_shift_max > 0 and random.random() < self.line_shift_prob:
+            dy = random.randint(-self.line_shift_max, self.line_shift_max)
+            dx = random.randint(-self.line_shift_max, self.line_shift_max)
+            if dy != 0 or dx != 0:
+                shifted = self._shift_no_wrap(line, dy, dx)
+                # Keep the reliable observed part outside the mask; perturb mainly the hole.
+                line = line * (1.0 - mask) + shifted * mask
+
+        k = max(1, int(self.line_morph_kernel))
+        if k % 2 == 0:
+            k += 1
+        pad = k // 2
+
+        # Dilation/thickening and erosion/thinning simulate line-width mismatch.
+        if self.line_dilate_prob > 0 and random.random() < self.line_dilate_prob:
+            dilated = F.max_pool2d(line, kernel_size=k, stride=1, padding=pad)
+            line = line * (1.0 - mask) + dilated * mask
+
+        if self.line_erode_prob > 0 and random.random() < self.line_erode_prob:
+            eroded = 1.0 - F.max_pool2d(1.0 - line, kernel_size=k, stride=1, padding=pad)
+            line = line * (1.0 - mask) + eroded * mask
+
+        # Sparse false positives in the hole mimic wrong HAWP/Geo line fragments.
+        if self.line_noise_prob > 0 and self.line_noise_density > 0 and random.random() < self.line_noise_prob:
+            noise = (torch.rand_like(line) < self.line_noise_density).to(line)
+            if k > 1:
+                noise = F.max_pool2d(noise, kernel_size=k, stride=1, padding=pad)
+            line = torch.clamp(line + noise * mask, 0.0, 1.0)
+
+        return torch.clamp(line, 0.0, 1.0)
 
     def __getitem__(self, index):
         video_name = self.video_names[index]
@@ -438,6 +537,8 @@ class TrainDataset(torch.utils.data.Dataset):
         frame_tensors = self._to_tensors(frames) * 2.0 - 1.0
         mask_tensors = self._to_tensors(masks)
         line_tensors = self._to_tensors(lines)
+        clean_line_tensors = line_tensors.clone()
+        line_tensors = self._augment_line_tensors(line_tensors, mask_tensors)
         if self.load_flow:
             flows_f = np.stack(flows_f, axis=-1) # H W 2 T-1
             flows_b = np.stack(flows_b, axis=-1)
@@ -445,10 +546,16 @@ class TrainDataset(torch.utils.data.Dataset):
             flows_b = torch.from_numpy(flows_b).permute(3, 2, 0, 1).contiguous().float()
 
         # img [-1,1] mask [0,1]
-        if self.load_flow:
-            return frame_tensors, mask_tensors, line_tensors, flows_f, flows_b, video_name
+        if self.return_clean_line_for_loss:
+            if self.load_flow:
+                return frame_tensors, mask_tensors, line_tensors, clean_line_tensors, flows_f, flows_b, video_name
+            else:
+                return frame_tensors, mask_tensors, line_tensors, clean_line_tensors, 'None', 'None', video_name
         else:
-            return frame_tensors, mask_tensors, line_tensors, 'None', 'None', video_name
+            if self.load_flow:
+                return frame_tensors, mask_tensors, line_tensors, flows_f, flows_b, video_name
+            else:
+                return frame_tensors, mask_tensors, line_tensors, 'None', 'None', video_name
 
 
 class TestDataset(torch.utils.data.Dataset):
