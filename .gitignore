@@ -1,6 +1,7 @@
 ##output directory
 tsr_output/
 geo_output/
+geo_output_no_solid/
 eval_line/
 eval_line_cheating/
 eval_video/

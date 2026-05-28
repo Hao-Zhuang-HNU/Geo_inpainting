@@ -304,7 +304,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--width', type=int, default=-1, help='Width of the processing video.')
     parser.add_argument(
-        '--mask_dilation', type=int, default=4, help='Mask dilation for video and flow masking.')
+        '--mask_dilation', type=int, default=0, help='Mask dilation for video and flow masking.')
     parser.add_argument(
         "--ref_stride", type=int, default=10, help='Stride of global reference frames.')
     parser.add_argument(
