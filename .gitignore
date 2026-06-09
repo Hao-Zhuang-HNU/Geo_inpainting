@@ -8,7 +8,7 @@ eval_video/
 eval_video_cheating/
 results/
 results_GTLine/
-
+ablation/
 ##list
 DL3DV_testlist/
 ScannetPP_testlist/
