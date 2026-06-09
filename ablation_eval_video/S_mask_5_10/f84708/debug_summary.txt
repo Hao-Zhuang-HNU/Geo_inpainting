@@ -1,0 +1,23 @@
+========== Debug Summary ==========
+frames: 253
+mask_shift: 0
+first_aligned_pair: pred[0] <-> gt[0] <-> mask[0]
+last_aligned_pair : pred[252] <-> gt[252] <-> mask[252]
+pred_gt_name_mismatch: 253
+gt_mask_name_mismatch: 253
+PSNR_hole_gt_PSNR_all_count: 3
+mask_ratio_mean: 0.080954
+mask_ratio_min : 0.050232
+mask_ratio_max : 0.099915
+PSNR_nomask_mean: 44.502821
+SSIM_nomask_mean: 0.991477
+nonmask_dil30_ratio_mean: 0.157504
+PSNR_nonmask_dil30_mean: 43.558250
+SSIM_nonmask_dil30_mean: 0.967555
+
+Potential reasons why PSNR_hole > PSNR_all:
+1. mask区域很小，且恰好容易恢复，而非mask区域误差更大。
+2. mask与gt/pred未严格对应（index对齐错误）。
+3. mask前景/背景取反。
+4. resize后mask边界发生偏移。
+5. pred/gt存在排序差异（例如0001.png与1.png）。

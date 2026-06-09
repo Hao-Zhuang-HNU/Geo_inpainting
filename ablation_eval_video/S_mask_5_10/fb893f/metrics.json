@@ -1,0 +1,23 @@
+{
+  "count_frames": 500,
+  "jump_image": 0,
+  "jump_mask": 0,
+  "mask_shift": 0,
+  "PSNR_all": 36.997481856754625,
+  "PSNR_hole": 29.817868871054703,
+  "SSIM_all": 0.9746726928949356,
+  "SSIM_hole": 0.9428843080997467,
+  "PSNR_nomask": 40.28057845221472,
+  "SSIM_nomask": 0.9835858943462372,
+  "LPIPS": 0.013768011785577983,
+  "FID": 9.243898130862732,
+  "VFID_proxy": 0.806974556126363,
+  "VFID_backbone": "r3d_18",
+  "Ewarp_all": 0.001393813486923725,
+  "Ewarp_hole": 0.002298059025181834,
+  "tLPIPS_all": 0.12796351360250452,
+  "tLPIPS_hole": 0.11199923695806033,
+  "tLPIPS_hole_valid_frames": 499,
+  "tLPIPS_hole_skipped_small_crop": 0,
+  "flow_source": "gt"
+}

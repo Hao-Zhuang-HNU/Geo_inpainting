@@ -7,7 +7,7 @@ eval_line_cheating/
 eval_video/
 eval_video_cheating/
 results/
-gt_line/
+results_GTLine/
 
 ##list
 DL3DV_testlist/

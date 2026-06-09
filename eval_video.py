@@ -147,6 +147,18 @@ class LPIPSMetric:
         return float(self.model(p, g).item())
 
 
+def lpips_crop_is_valid(arr: np.ndarray, min_size: int = 32) -> bool:
+    """
+    LPIPS with AlexNet/VGG-style backbones cannot safely process extremely thin crops.
+    Example failure: a crop with W=2 becomes W=0 after repeated pooling.
+    For tLPIPS_hole, such tiny bboxes are also not a stable perceptual metric region.
+    """
+    if arr is None or arr.ndim != 3:
+        return False
+    h, w = arr.shape[:2]
+    return h >= min_size and w >= min_size
+
+
 # ----------------------- FID -----------------------
 class InceptionPool3(nn.Module):
     def __init__(self, device: torch.device):
@@ -358,6 +370,7 @@ def compute_ewarp_and_tlpips(
 ) -> Dict[str, float]:
     e_all, e_hole = [], []
     tlp_all, tlp_hole = [], []
+    tlp_hole_skipped_small_crop = 0
 
     N = min(len(pred_frames), len(gt_frames))
     if N < 2:
@@ -401,14 +414,24 @@ def compute_ewarp_and_tlpips(
                     pad = 8
                     y0 = max(0, y0 - pad); y1 = min(pred_t.shape[0]-1, y1 + pad)
                     x0 = max(0, x0 - pad); x1 = min(pred_t.shape[1]-1, x1 + pad)
-                    tlp_hole.append(lpips_metric(pred_t[y0:y1+1, x0:x1+1, :],
-                                                 warped_pred_tp1[y0:y1+1, x0:x1+1, :]))
+                    crop_pred = pred_t[y0:y1+1, x0:x1+1, :]
+                    crop_warp = warped_pred_tp1[y0:y1+1, x0:x1+1, :]
+
+                    # Avoid LPIPS/AlexNet crash on extremely thin hole bboxes.
+                    # Such tiny crops are not reliable perceptual regions; skip them
+                    # instead of letting max_pool2d produce a zero-sized feature map.
+                    if lpips_crop_is_valid(crop_pred, min_size=32) and lpips_crop_is_valid(crop_warp, min_size=32):
+                        tlp_hole.append(lpips_metric(crop_pred, crop_warp))
+                    else:
+                        tlp_hole_skipped_small_crop += 1
 
     return {
         "Ewarp_all": float(np.mean(e_all)) if len(e_all) else float("nan"),
         "Ewarp_hole": float(np.mean(e_hole)) if len(e_hole) else float("nan"),
         "tLPIPS_all": float(np.mean(tlp_all)) if len(tlp_all) else float("nan"),
         "tLPIPS_hole": float(np.mean(tlp_hole)) if len(tlp_hole) else float("nan"),
+        "tLPIPS_hole_valid_frames": int(len(tlp_hole)),
+        "tLPIPS_hole_skipped_small_crop": int(tlp_hole_skipped_small_crop),
     }
 
 
@@ -457,6 +480,8 @@ def main():
                         help="跳过前N张pred/gt图像。例：--jump_image 1 表示 pred[1]/gt[1] <-> mask[0]")
     parser.add_argument("--jump_mask", type=int, default=0,
                         help="跳过前N张gt/mask。例：--jump_mask 1 表示 pred[0] <-> gt[1]/mask[1]")
+    parser.add_argument("--repeat_short_masks", action="store_false",
+                        help="当mask数量少于帧数时循环复用mask：mask[i % len(masks)]。默认仍保持原逻辑：超出部分无mask。")
     args = parser.parse_args()
 
     pred_root = Path(args.pre_path)
@@ -498,14 +523,27 @@ def main():
             print("[WARN] mask_path 下未找到任何 mask，hole 指标将为 NaN")
         else:
             if len(masks) < N:
-                print(f"[WARN] masks={len(masks)} < frames={N} -> remaining frames have no mask")
-            if len(masks) > N:
-                # 你明确说 mask 比图片多：直接取前 N 个
-                print(f"[INFO] masks={len(masks)} > frames={N} -> take first N masks by natural order")
-            for i in range(min(N, len(masks))):
-                mask_frames[i] = masks[i]
-                mask_indices[i] = i
-            print(f"[INFO] mask matched by index. seq_name={seq_name}. used_masks={min(N,len(masks))}")
+                if args.repeat_short_masks:
+                    print(f"[INFO] masks={len(masks)} < frames={N} -> repeat masks by modulo")
+                    for i in range(N):
+                        mi = i % len(masks)
+                        mask_frames[i] = masks[mi]
+                        mask_indices[i] = mi
+                    print(f"[INFO] mask matched by modulo repeat. seq_name={seq_name}. used_masks={N}, unique_masks={len(masks)}")
+                else:
+                    print(f"[WARN] masks={len(masks)} < frames={N} -> remaining frames have no mask")
+                    for i in range(len(masks)):
+                        mask_frames[i] = masks[i]
+                        mask_indices[i] = i
+                    print(f"[INFO] mask matched by index. seq_name={seq_name}. used_masks={len(masks)}")
+            else:
+                if len(masks) > N:
+                    # 你明确说 mask 比图片多：直接取前 N 个
+                    print(f"[INFO] masks={len(masks)} > frames={N} -> take first N masks by natural order")
+                for i in range(N):
+                    mask_frames[i] = masks[i]
+                    mask_indices[i] = i
+                print(f"[INFO] mask matched by index. seq_name={seq_name}. used_masks={N}")
 
     # 3) temporal jump alignment
     # --jump_image N:
