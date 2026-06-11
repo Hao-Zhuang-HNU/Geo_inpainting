@@ -9,6 +9,9 @@ eval_video_cheating/
 results/
 results_GTLine/
 ablation/
+soft_line/
+
+
 ##list
 DL3DV_testlist/
 ScannetPP_testlist/

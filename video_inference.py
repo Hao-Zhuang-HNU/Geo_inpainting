@@ -74,6 +74,120 @@ def binary_mask(mask, th=0.1):
     return mask
   
   
+def _percentile_normalize_line(line_gray, p_low=1.0, p_high=99.5, blur_ksize=0):
+    """Normalize a raw grayscale line map into a soft confidence map [0, 1]."""
+    line = line_gray.astype(np.float32)
+    if line.max() > 1.5:
+        line = line / 255.0
+    if blur_ksize and blur_ksize > 1:
+        k = int(blur_ksize)
+        if k % 2 == 0:
+            k += 1
+        line = cv2.GaussianBlur(line, (k, k), 0)
+    hi = np.percentile(line, p_high)
+    lo = np.percentile(line, p_low)
+    if hi <= lo + 1e-6:
+        return np.clip(line, 0, 1)
+    line = (line - lo) / (hi - lo + 1e-6)
+    return np.clip(line, 0, 1)
+
+
+def _hysteresis_keep_connected(soft, strong_thr=0.45, weak_thr=0.15):
+    """Keep weak line responses only if connected to strong responses."""
+    strong = soft >= float(strong_thr)
+    weak = soft >= float(weak_thr)
+    if weak.sum() == 0:
+        return weak, strong
+    if strong.sum() == 0:
+        # Fallback for globally faint line maps: keep weak responses.
+        return weak, weak
+    labels, num = scipy.ndimage.label(weak)
+    if num == 0:
+        return weak, strong
+    keep_ids = np.unique(labels[strong])
+    keep_ids = keep_ids[keep_ids > 0]
+    connected = np.isin(labels, keep_ids)
+    return connected, strong
+
+
+def _make_reliability_aware_line_field(
+        line_img,
+        mask_img=None,
+        strong_thr=0.45,
+        weak_thr=0.15,
+        soft_weight=0.35,
+        reliability_sigma=3.0,
+        boundary_width=5,
+        boundary_decay=0.20,
+        p_low=1.0,
+        p_high=99.5,
+        blur_ksize=0):
+    """Return a single-channel reliability-aware final line map.
+
+    This matches the single-channel fine-tuning setup. It computes
+    center/soft/reliability internally, then collapses them as:
+        final = center + soft_weight * soft * reliability
+    The returned PIL image is mode 'L', so to_tensors() gives [1,H,W].
+    """
+    gray = np.array(line_img.convert('L'))
+    soft = _percentile_normalize_line(gray, p_low=p_low, p_high=p_high, blur_ksize=blur_ksize)
+    connected, strong = _hysteresis_keep_connected(soft, strong_thr=strong_thr, weak_thr=weak_thr)
+
+    # Center/strong channel. Use connected strong-ish regions rather than a
+    # fragile one-pixel skeleton; the soft/reliability channels retain uncertainty.
+    center = strong.astype(np.float32)
+    if center.sum() == 0:
+        center = connected.astype(np.float32)
+
+    # Reliability: shallow lines close to a strong response are trusted, isolated
+    # shallow lines are suppressed.
+    if strong.sum() > 0:
+        dist = scipy.ndimage.distance_transform_edt(~strong)
+    else:
+        dist = scipy.ndimage.distance_transform_edt(~connected)
+    rel = soft * np.exp(-dist / max(float(reliability_sigma), 1e-6))
+    rel = np.clip(rel, 0, 1)
+
+    # Suppress false contours on mask boundaries.
+    if mask_img is not None and boundary_width > 0:
+        m = np.array(mask_img.convert('L')) > 127
+        dil = scipy.ndimage.binary_dilation(m, iterations=int(boundary_width))
+        ero = scipy.ndimage.binary_erosion(m, iterations=int(boundary_width))
+        boundary = (dil.astype(np.uint8) - ero.astype(np.uint8)).astype(bool)
+        decay = np.ones_like(soft, dtype=np.float32)
+        decay[boundary] = float(boundary_decay)
+        soft = soft * decay
+        rel = rel * decay
+        center = center * decay
+
+    final = center + float(soft_weight) * soft * rel
+    final = np.clip(final, 0, 1)
+    return Image.fromarray((final * 255.0 + 0.5).astype(np.uint8), mode='L')
+
+
+def build_reliability_line_fields(line_imgs, mask_imgs=None, temporal_alpha=0.15, **kwargs):
+    """Build single-channel reliability-aware final line maps for a video."""
+    if line_imgs is None:
+        return None
+    out = []
+    for i, line_img in enumerate(line_imgs):
+        mask_img = mask_imgs[i] if mask_imgs is not None and i < len(mask_imgs) else None
+        out.append(_make_reliability_aware_line_field(line_img, mask_img=mask_img, **kwargs))
+
+    # Lightweight temporal stabilization on the final single-channel line map.
+    if temporal_alpha and temporal_alpha > 0 and len(out) > 2:
+        arrs = [np.array(x.convert('L')).astype(np.float32) / 255.0 for x in out]
+        smoothed = []
+        for i, arr in enumerate(arrs):
+            prev_arr = arrs[max(0, i - 1)]
+            next_arr = arrs[min(len(arrs) - 1, i + 1)]
+            temporal = (prev_arr + arr + next_arr) / 3.0
+            arr2 = (1.0 - float(temporal_alpha)) * arr + float(temporal_alpha) * temporal
+            smoothed.append(Image.fromarray((np.clip(arr2, 0, 1) * 255.0 + 0.5).astype(np.uint8), mode='L'))
+        out = smoothed
+    return out
+
+
 # read frame-wise masks
 def read_mask(mpath, length, size, flow_mask_dilates=8, mask_dilates=5):
     masks_img = []
@@ -291,6 +405,20 @@ if __name__ == '__main__':
     parser.add_argument(
         '--line_no_invert_y', action='store_true', help='Disable image-coordinate y-axis convention when rendering pkl lines. Ignored for image line maps.')
     parser.add_argument(
+        '--line_soft_guidance', action='store_true',
+        help='Use reliability-aware single-channel soft line map: center + soft_weight * soft * reliability.')
+    parser.add_argument('--line_strong_thr', type=float, default=0.45, help='Strong threshold for reliability-aware line processing.')
+    parser.add_argument('--line_weak_thr', type=float, default=0.15, help='Weak threshold for reliability-aware line processing.')
+    parser.add_argument('--line_soft_weight', type=float, default=0.35, help='Weight for final single-channel map: center + weight * soft * reliability. Default 0.35 matches fine-tuning preprocessing.')
+    parser.add_argument('--line_reliability_sigma', type=float, default=3.0, help='Distance decay sigma for reliability map.')
+    parser.add_argument('--line_boundary_width', type=int, default=5, help='Suppress line responses around mask boundary by this width.')
+    parser.add_argument('--line_boundary_decay', type=float, default=0.20, help='Multiplier for line responses on mask boundary.')
+    parser.add_argument('--line_norm_p_low', type=float, default=1.0, help='Low percentile for soft line normalization.')
+    parser.add_argument('--line_norm_p_high', type=float, default=99.5, help='High percentile for soft line normalization.')
+    parser.add_argument('--line_blur_ksize', type=int, default=0, help='Optional Gaussian blur kernel size before line normalization; 0 disables it.')
+    parser.add_argument('--line_temporal_alpha', type=float, default=0.15, help='Temporal smoothing strength for soft/reliability channels.')
+    parser.add_argument('--save_line_debug', action='store_true', help='Save processed center/soft/reliability line maps for debugging.')
+    parser.add_argument(
         '-o', '--output', type=str, default='results', help='Output folder. Default: results')
     parser.add_argument(
         '--ckpt_path',
@@ -355,6 +483,19 @@ if __name__ == '__main__':
                                   line_width=args.line_width,
                                   line_swap_xy=not args.line_no_swap_xy,
                                   line_invert_y=not args.line_no_invert_y)
+        if args.line_soft_guidance and line_imgs is not None:
+            line_imgs = build_reliability_line_fields(
+                line_imgs, mask_imgs=masks_dilated,
+                strong_thr=args.line_strong_thr,
+                weak_thr=args.line_weak_thr,
+                soft_weight=args.line_soft_weight,
+                reliability_sigma=args.line_reliability_sigma,
+                boundary_width=args.line_boundary_width,
+                boundary_decay=args.line_boundary_decay,
+                p_low=args.line_norm_p_low,
+                p_high=args.line_norm_p_high,
+                blur_ksize=args.line_blur_ksize,
+                temporal_alpha=args.line_temporal_alpha)
         w, h = size
     elif args.mode == 'video_outpainting':
         assert args.scale_h is not None and args.scale_w is not None, 'Please provide a outpainting scale (s_h, s_w).'
@@ -381,6 +522,24 @@ if __name__ == '__main__':
     frames = to_tensors()(frames).unsqueeze(0) * 2 - 1    
     flow_masks = to_tensors()(flow_masks).unsqueeze(0)
     masks_dilated = to_tensors()(masks_dilated).unsqueeze(0)
+    if args.save_line_debug and line_imgs is not None:
+        dbg_root = os.path.join(save_root, 'line_debug')
+        os.makedirs(dbg_root, exist_ok=True)
+        for idx, li in enumerate(line_imgs):
+            arr = np.array(li)
+            if arr.ndim == 2:
+                Image.fromarray(arr).save(os.path.join(dbg_root, f'{idx:04d}_final_line.png'))
+            else:
+                # Backward compatibility only; the single-channel path should not enter here.
+                Image.fromarray(arr[..., 0]).save(os.path.join(dbg_root, f'{idx:04d}_center.png'))
+                Image.fromarray(arr[..., 1]).save(os.path.join(dbg_root, f'{idx:04d}_soft.png'))
+                Image.fromarray(arr[..., 2]).save(os.path.join(dbg_root, f'{idx:04d}_reliability.png'))
+                center = arr[..., 0].astype(np.float32) / 255.0
+                soft = arr[..., 1].astype(np.float32) / 255.0
+                rel = arr[..., 2].astype(np.float32) / 255.0
+                final = np.clip(center + float(args.line_soft_weight) * soft * rel, 0, 1)
+                Image.fromarray((final * 255.0 + 0.5).astype(np.uint8)).save(os.path.join(dbg_root, f'{idx:04d}_final_line.png'))
+
     line_tensors = to_tensors()(line_imgs).unsqueeze(0) if line_imgs is not None else None
     frames, flow_masks, masks_dilated = frames.to(device), flow_masks.to(device), masks_dilated.to(device)
     if line_tensors is not None:
