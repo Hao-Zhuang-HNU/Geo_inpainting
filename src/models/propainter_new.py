@@ -253,47 +253,25 @@ class deconv(nn.Module):
         return self.conv(x)
 
 
-class ReliabilityAwareLineFieldEncoder(nn.Module):
-    """Encode reliability-aware soft line fields to ProPainter feature space.
+class LineEncoder(nn.Module):
+    """Encode sparse pkl-rendered wireframe maps to ProPainter feature space.
 
-    Expected input: [B*T, 3, H, W]
-      channel 0: center/strong line response
-      channel 1: soft line probability field
-      channel 2: reliability field
-
+    Input:  [B*T, 1, H, W], value range [0, 1], white line on black background.
     Output: [B*T, 128, H/4, W/4], aligned with Encoder output.
     """
-    def __init__(self, in_channels=3, out_channels=128):
-        super(ReliabilityAwareLineFieldEncoder, self).__init__()
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1),
+    def __init__(self, out_channels=128):
+        super(LineEncoder, self).__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-        )
-        self.down1 = nn.Sequential(
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(64, out_channels, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
-        )
-        self.down2 = nn.Sequential(
-            nn.Conv2d(64, out_channels, kernel_size=3, stride=2, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-        )
-        self.refine = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1),
         )
 
     def forward(self, x):
-        x = self.stem(x)
-        x = self.down1(x)
-        x = self.down2(x)
-        return x + self.refine(x)
+        return self.net(x)
 
 
 class InpaintGenerator(BaseNetwork):
@@ -305,22 +283,13 @@ class InpaintGenerator(BaseNetwork):
         # encoder
         self.encoder = Encoder()
 
-        # Reliability-aware structure branch. This branch accepts either the old
-        # 1-channel line map or a new 3-channel structure field:
-        # [center_line, soft_line, reliability]. It is fused by a learned gate so
-        # weak/uncertain line responses can guide texture synthesis without
-        # overwhelming RGB/mask features.
-        self.line_encoder = ReliabilityAwareLineFieldEncoder(in_channels=3, out_channels=channel)
+        # line guidance branch. It is randomly initialized when loading the
+        # official ProPainter checkpoint with strict=False.
+        self.line_encoder = LineEncoder(out_channels=channel)
         self.line_fuse = nn.Sequential(
             nn.Conv2d(channel * 2, channel, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(channel, channel, kernel_size=3, stride=1, padding=1),
-        )
-        self.line_gate = nn.Sequential(
-            nn.Conv2d(channel * 2 + 1, channel, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(channel, channel, kernel_size=3, stride=1, padding=1),
-            nn.Sigmoid(),
         )
 
         # decoder
@@ -368,79 +337,14 @@ class InpaintGenerator(BaseNetwork):
         if model_path is not None:
             print('Pretrained ProPainter has loaded...')
             ckpt = torch.load(model_path, map_location='cpu')
-            if isinstance(ckpt, dict) and 'state_dict' in ckpt:
-                ckpt = ckpt['state_dict']
-            current = self.state_dict()
-            compatible = {}
-            skipped_shape = []
-            for k, v in ckpt.items():
-                # Strip common wrappers if present.
-                kk = k[7:] if k.startswith('module.') else k
-                if kk in current and tuple(current[kk].shape) == tuple(v.shape):
-                    compatible[kk] = v
-                elif kk in current:
-                    skipped_shape.append((kk, tuple(v.shape), tuple(current[kk].shape)))
-            missing, unexpected = self.load_state_dict(compatible, strict=False)
-            if len(skipped_shape) > 0:
-                print('[Reliability-Aware ProPainter] skipped shape-mismatched keys:')
-                for item in skipped_shape[:30]:
-                    print('  ', item)
-                if len(skipped_shape) > 30:
-                    print(f'  ... {len(skipped_shape) - 30} more')
+            missing, unexpected = self.load_state_dict(ckpt, strict=False)
             if len(missing) > 0:
-                print(f'[Reliability-Aware ProPainter] missing keys when loading pretrained weights: {missing}')
+                print(f'[Line-Guided ProPainter] missing keys when loading pretrained weights: {missing}')
             if len(unexpected) > 0:
-                print(f'[Reliability-Aware ProPainter] unexpected keys when loading pretrained weights: {unexpected}')
+                print(f'[Line-Guided ProPainter] unexpected keys when loading pretrained weights: {unexpected}')
 
         # print network parameter number
         self.print_network()
-
-    def _make_line_field(self, line_guidance, masks_in=None):
-        """Convert old 1-channel line maps to a 3-channel soft structure field.
-
-        If line_guidance already has 3 channels, it is used directly. This keeps
-        the network compatible with both existing dataloaders and the new
-        inference-time reliability-aware line processor.
-        """
-        if line_guidance is None:
-            return None
-        if line_guidance.dim() != 5:
-            raise ValueError(f'line_guidance must be [B,T,C,H,W], got {tuple(line_guidance.shape)}')
-
-        b, t, c, h, w = line_guidance.shape
-        line = line_guidance.float().clamp(0, 1)
-        if c >= 3:
-            return line[:, :, :3]
-        if c != 1:
-            # Defensive fallback: average arbitrary channels to one soft map.
-            line = line.mean(dim=2, keepdim=True)
-
-        soft = line
-        # Soft strong/weak estimators. They are intentionally smooth so a
-        # fine-tuned checkpoint can learn from the confidence field.
-        strong = torch.sigmoid((soft - 0.45) * 20.0)
-        weak = torch.sigmoid((soft - 0.15) * 12.0)
-
-        flat_strong = strong.view(b * t, 1, h, w)
-        # Strong-neighborhood reliability: weak line responses close to stronger
-        # responses are more useful than isolated weak noise.
-        near_strong = F.max_pool2d(flat_strong, kernel_size=7, stride=1, padding=3).view(b, t, 1, h, w)
-        reliability = (soft * (0.35 + 0.65 * near_strong)).clamp(0, 1)
-
-        if masks_in is not None:
-            # Suppress mask-edge artifacts. Many generated line maps contain a
-            # false contour on the mask boundary; this prevents that contour from
-            # dominating the structure branch.
-            m = masks_in.float().clamp(0, 1).view(b * t, 1, h, w)
-            dil = F.max_pool2d(m, kernel_size=7, stride=1, padding=3)
-            ero = 1.0 - F.max_pool2d(1.0 - m, kernel_size=7, stride=1, padding=3)
-            boundary = (dil - ero).clamp(0, 1).view(b, t, 1, h, w)
-            boundary_decay = 1.0 - 0.80 * boundary
-            soft = soft * boundary_decay
-            reliability = reliability * boundary_decay
-            strong = strong * boundary_decay
-
-        return torch.cat([strong, soft, reliability], dim=2).clamp(0, 1)
 
     def img_propagation(self, masked_frames, completed_flows, masks, interpolation='nearest'):
         _, _, prop_frames, updated_masks = self.img_prop_module(masked_frames, completed_flows[0], completed_flows[1], masks, interpolation)
@@ -464,21 +368,39 @@ class InpaintGenerator(BaseNetwork):
                                         masks_in.view(b * t, 1, ori_h, ori_w),
                                         masks_updated.view(b * t, 1, ori_h, ori_w)], dim=1))
 
-        # Reliability-aware structure fusion. The model accepts the previous
-        # 1-channel line map or a 3-channel field [center, soft, reliability].
-        # A learned gate uses both image/mask features and structural features,
-        # reducing false guidance from isolated weak lines or mask-boundary edges.
+        # feature-level line guidance fusion. This keeps the official 5-channel
+        # RGB/mask encoder compatible with pretrained ProPainter weights.
+        # If line_guidance is None, the branch is skipped to preserve original
+        # ProPainter behavior before line-guided fine-tuning.
         if line_guidance is not None:
-            line_field = self._make_line_field(line_guidance, masks_in=masks_in)
-            line_field = line_field.view(b * t, 3, ori_h, ori_w).to(device=enc_feat.device, dtype=enc_feat.dtype)
-            line_feat = self.line_encoder(line_field)
-            mask_ds = F.interpolate(
-                masks_in.reshape(-1, 1, ori_h, ori_w).float(),
-                size=enc_feat.shape[-2:], mode='nearest'
-            ).to(dtype=enc_feat.dtype)
+            # Single-channel training/inference compatibility.
+            # This checkpoint was fine-tuned with one-channel soft-guidance maps.
+            # Expected shape is [B,T,1,H,W]. If an older inference path supplies
+            # [B,T,3,H,W] = [center, soft, reliability], collapse it to the same
+            # final-line formula used by preprocessing/inference.
+            if line_guidance.dim() == 5:
+                if line_guidance.size(2) == 3:
+                    center = line_guidance[:, :, 0:1, :, :]
+                    soft = line_guidance[:, :, 1:2, :, :]
+                    reliability = line_guidance[:, :, 2:3, :, :]
+                    line_guidance = torch.clamp(center + 0.35 * soft * reliability, 0.0, 1.0)
+                elif line_guidance.size(2) != 1:
+                    line_guidance = line_guidance[:, :, 0:1, :, :]
+            elif line_guidance.dim() == 4:
+                if line_guidance.size(1) == 3:
+                    center = line_guidance[:, 0:1, :, :]
+                    soft = line_guidance[:, 1:2, :, :]
+                    reliability = line_guidance[:, 2:3, :, :]
+                    line_guidance = torch.clamp(center + 0.35 * soft * reliability, 0.0, 1.0)
+                elif line_guidance.size(1) != 1 and line_guidance.size(0) == b * t:
+                    line_guidance = line_guidance[:, 0:1, :, :]
+                elif line_guidance.size(0) == b and line_guidance.size(1) == t:
+                    line_guidance = line_guidance.unsqueeze(2)
+
+            line_guidance = line_guidance.contiguous()
+            line_feat = self.line_encoder(line_guidance.view(b * t, 1, ori_h, ori_w).to(dtype=enc_feat.dtype))
             line_delta = self.line_fuse(torch.cat([enc_feat, line_feat], dim=1))
-            line_gate = self.line_gate(torch.cat([enc_feat, line_feat, mask_ds], dim=1))
-            enc_feat = enc_feat + float(line_guidance_weight) * line_gate * line_delta
+            enc_feat = enc_feat + float(line_guidance_weight) * line_delta
         _, c, h, w = enc_feat.size()
         local_feat = enc_feat.view(b, t, c, h, w)[:, :l_t, ...]
         ref_feat = enc_feat.view(b, t, c, h, w)[:, l_t:, ...]
