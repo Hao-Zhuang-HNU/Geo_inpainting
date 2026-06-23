@@ -133,6 +133,31 @@ class Trainer:
 
     def setup_optimizers(self):
         """Set up optimizers."""
+        freeze_mode = self.config['trainer'].get('freeze_mode', 'none')
+        if freeze_mode != 'none':
+            print(f'[INFO] Applying freeze_mode={freeze_mode}')
+            for name, param in self.netG.named_parameters():
+                if freeze_mode == 'reliability_only':
+                    trainable = name.startswith('reliability_line_')
+                elif freeze_mode == 'line_decoder':
+                    trainable = (name.startswith('reliability_line_') or
+                                 name.startswith('line_encoder') or
+                                 name.startswith('line_fuse') or
+                                 name.startswith('decoder'))
+                elif freeze_mode == 'all_line':
+                    trainable = (name.startswith('reliability_line_') or
+                                 name.startswith('line_encoder') or
+                                 name.startswith('line_fuse'))
+                else:
+                    trainable = True
+                param.requires_grad = trainable
+
+        # Optional runtime override for the new branch strength.
+        rel_w = self.config.get('reliability_line_weight', self.config.get('model', {}).get('reliability_line_weight', None))
+        if rel_w is not None and hasattr(self.netG, 'reliability_line_weight'):
+            self.netG.reliability_line_weight = float(rel_w)
+            print(f'[INFO] reliability_line_weight={self.netG.reliability_line_weight}')
+
         backbone_params = []
         for name, param in self.netG.named_parameters():
             if param.requires_grad:
@@ -389,6 +414,25 @@ class Trainer:
                 break
         print('\nEnd training....')
 
+
+    def _line_region_from_guidance(self, line_tensors, h, w):
+        """Create a single-channel line region from 1ch or RGB line guidance.
+
+        For RGB fields [center, soft, reliability], use center + soft*reliability.
+        This prevents shape errors in line-weighted and Sobel losses.
+        """
+        if line_tensors.dim() != 5:
+            return line_tensors.view(-1, 1, h, w)
+        b, t, c, _, _ = line_tensors.shape
+        if c >= 3:
+            center = line_tensors[:, :, 0:1]
+            soft = line_tensors[:, :, 1:2]
+            rel = line_tensors[:, :, 2:3]
+            line = torch.clamp(center + 0.35 * soft * rel, 0.0, 1.0)
+        else:
+            line = line_tensors[:, :, 0:1]
+        return line.contiguous().view(-1, 1, h, w)
+
     def _train_epoch(self, pbar):
         """Process input and calculate loss every training epoch"""
         device = self.config['device']
@@ -478,7 +522,7 @@ class Trainer:
                 line_alpha = self.config['losses'].get('line_loss_alpha', 3.0)
                 # Dilate sparse line supervision slightly so a 1-pixel pkl line still affects nearby RGB pixels.
                 line_region = F.max_pool2d(
-                    line_loss_tensors.view(-1, 1, h, w), kernel_size=5, stride=1, padding=2
+                    self._line_region_from_guidance(line_loss_tensors, h, w), kernel_size=5, stride=1, padding=2
                 ).view(b, t, 1, h, w)
                 line_weight = 1.0 + line_alpha * line_region
                 denom = torch.mean(masks * line_weight).clamp_min(1e-6)
@@ -492,7 +536,7 @@ class Trainer:
             if self.use_line_guidance and sobel_weight > 0:
                 sobel_line_alpha = self.config['losses'].get('sobel_line_alpha', 2.0)
                 line_region = F.max_pool2d(
-                    line_loss_tensors.view(-1, 1, h, w), kernel_size=5, stride=1, padding=2
+                    self._line_region_from_guidance(line_loss_tensors, h, w), kernel_size=5, stride=1, padding=2
                 ).view(b, t, 1, h, w)
                 sobel_pred = self._sobel_grad(pred_imgs)
                 sobel_gt = self._sobel_grad(frames)
