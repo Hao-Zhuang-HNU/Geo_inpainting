@@ -20,7 +20,7 @@ MVImgNet_testlist/
 BundleFusion_testlist/
 data_list/
 filter_results/
-
+shell/
 ##pth
 ckpt/
 gt_line/
