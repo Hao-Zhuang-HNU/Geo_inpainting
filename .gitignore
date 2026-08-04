@@ -6,11 +6,12 @@ eval_line/
 eval_line_cheating/
 eval_video/
 eval_video_cheating/
+eval_video_line/
 results/
 results_GTLine/
 ablation/
 soft_line/
-
+compared_csv/
 
 ##list
 DL3DV_testlist/
@@ -19,7 +20,7 @@ MVImgNet_testlist/
 BundleFusion_testlist/
 data_list/
 filter_results/
-
+shell/
 ##pth
 ckpt/
 gt_line/
@@ -27,6 +28,11 @@ weights/
 video_logs/
 tb_logs/
 experiments_model/
+weights/
+
+##log
+logs/
+video_logs/
 
 
 ## IDE config

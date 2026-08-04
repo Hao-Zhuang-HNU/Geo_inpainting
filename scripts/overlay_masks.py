@@ -153,7 +153,7 @@ def main():
     parser.add_argument(
         "--mode",
         choices=["white", "fill", "green"],
-        default="green",
+        default="white",
         help=(
             "green: transparent green visualization; "
             "white/fill: fill mask region with an opaque constant value. Default: green"

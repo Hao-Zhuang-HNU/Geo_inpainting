@@ -115,19 +115,18 @@ def _make_reliability_aware_line_field(
         mask_img=None,
         strong_thr=0.45,
         weak_thr=0.15,
-        soft_weight=0.35,
+        soft_weight=1.0,
         reliability_sigma=3.0,
         boundary_width=5,
         boundary_decay=0.20,
         p_low=1.0,
         p_high=99.5,
         blur_ksize=0):
-    """Return a single-channel reliability-aware final line map.
+    """Return RGB PIL image where channels are [center_line, soft_line, reliability].
 
-    This matches the single-channel fine-tuning setup. It computes
-    center/soft/reliability internally, then collapses them as:
-        final = center + soft_weight * soft * reliability
-    The returned PIL image is mode 'L', so to_tensors() gives [1,H,W].
+    This preserves the shallow white response belt around true structures instead
+    of binarizing it away. The returned RGB image is compatible with torchvision
+    to_tensors(), producing [3,H,W] line_guidance for the network.
     """
     gray = np.array(line_img.convert('L'))
     soft = _percentile_normalize_line(gray, p_low=p_low, p_high=p_high, blur_ksize=blur_ksize)
@@ -160,13 +159,13 @@ def _make_reliability_aware_line_field(
         rel = rel * decay
         center = center * decay
 
-    final = center + float(soft_weight) * soft * rel
-    final = np.clip(final, 0, 1)
-    return Image.fromarray((final * 255.0 + 0.5).astype(np.uint8), mode='L')
+    soft = np.clip(soft * float(soft_weight), 0, 1)
+    field = np.stack([center, soft, rel], axis=-1)
+    return Image.fromarray((field * 255.0 + 0.5).astype(np.uint8), mode='RGB')
 
 
 def build_reliability_line_fields(line_imgs, mask_imgs=None, temporal_alpha=0.15, **kwargs):
-    """Build single-channel reliability-aware final line maps for a video."""
+    """Build 3-channel reliability-aware line fields for a video."""
     if line_imgs is None:
         return None
     out = []
@@ -174,16 +173,18 @@ def build_reliability_line_fields(line_imgs, mask_imgs=None, temporal_alpha=0.15
         mask_img = mask_imgs[i] if mask_imgs is not None and i < len(mask_imgs) else None
         out.append(_make_reliability_aware_line_field(line_img, mask_img=mask_img, **kwargs))
 
-    # Lightweight temporal stabilization on the final single-channel line map.
+    # Lightweight temporal stabilization on soft/reliability channels. This avoids
+    # single-frame noisy responses dominating the texture branch.
     if temporal_alpha and temporal_alpha > 0 and len(out) > 2:
-        arrs = [np.array(x.convert('L')).astype(np.float32) / 255.0 for x in out]
+        arrs = [np.array(x).astype(np.float32) / 255.0 for x in out]
         smoothed = []
         for i, arr in enumerate(arrs):
             prev_arr = arrs[max(0, i - 1)]
             next_arr = arrs[min(len(arrs) - 1, i + 1)]
             temporal = (prev_arr + arr + next_arr) / 3.0
-            arr2 = (1.0 - float(temporal_alpha)) * arr + float(temporal_alpha) * temporal
-            smoothed.append(Image.fromarray((np.clip(arr2, 0, 1) * 255.0 + 0.5).astype(np.uint8), mode='L'))
+            arr2 = arr.copy()
+            arr2[..., 1:] = (1.0 - float(temporal_alpha)) * arr[..., 1:] + float(temporal_alpha) * temporal[..., 1:]
+            smoothed.append(Image.fromarray((np.clip(arr2, 0, 1) * 255.0 + 0.5).astype(np.uint8), mode='RGB'))
         out = smoothed
     return out
 
@@ -406,10 +407,10 @@ if __name__ == '__main__':
         '--line_no_invert_y', action='store_true', help='Disable image-coordinate y-axis convention when rendering pkl lines. Ignored for image line maps.')
     parser.add_argument(
         '--line_soft_guidance', action='store_true',
-        help='Use reliability-aware single-channel soft line map: center + soft_weight * soft * reliability.')
+        help='Use reliability-aware 3-channel line field [center, soft, reliability] instead of old 1-channel line map.')
     parser.add_argument('--line_strong_thr', type=float, default=0.45, help='Strong threshold for reliability-aware line processing.')
     parser.add_argument('--line_weak_thr', type=float, default=0.15, help='Weak threshold for reliability-aware line processing.')
-    parser.add_argument('--line_soft_weight', type=float, default=0.35, help='Weight for final single-channel map: center + weight * soft * reliability. Default 0.35 matches fine-tuning preprocessing.')
+    parser.add_argument('--line_soft_weight', type=float, default=1.0, help='Weight of the soft line channel before feeding it to the network.')
     parser.add_argument('--line_reliability_sigma', type=float, default=3.0, help='Distance decay sigma for reliability map.')
     parser.add_argument('--line_boundary_width', type=int, default=5, help='Suppress line responses around mask boundary by this width.')
     parser.add_argument('--line_boundary_decay', type=float, default=0.20, help='Multiplier for line responses on mask boundary.')
@@ -417,6 +418,7 @@ if __name__ == '__main__':
     parser.add_argument('--line_norm_p_high', type=float, default=99.5, help='High percentile for soft line normalization.')
     parser.add_argument('--line_blur_ksize', type=int, default=0, help='Optional Gaussian blur kernel size before line normalization; 0 disables it.')
     parser.add_argument('--line_temporal_alpha', type=float, default=0.15, help='Temporal smoothing strength for soft/reliability channels.')
+    parser.add_argument('--line_guidance_weight', type=float, default=1.0, help='Scale all line guidance branches in ProPainter.')
     parser.add_argument('--save_line_debug', action='store_true', help='Save processed center/soft/reliability line maps for debugging.')
     parser.add_argument(
         '-o', '--output', type=str, default='results', help='Output folder. Default: results')
@@ -528,17 +530,11 @@ if __name__ == '__main__':
         for idx, li in enumerate(line_imgs):
             arr = np.array(li)
             if arr.ndim == 2:
-                Image.fromarray(arr).save(os.path.join(dbg_root, f'{idx:04d}_final_line.png'))
+                Image.fromarray(arr).save(os.path.join(dbg_root, f'{idx:04d}_line.png'))
             else:
-                # Backward compatibility only; the single-channel path should not enter here.
                 Image.fromarray(arr[..., 0]).save(os.path.join(dbg_root, f'{idx:04d}_center.png'))
                 Image.fromarray(arr[..., 1]).save(os.path.join(dbg_root, f'{idx:04d}_soft.png'))
                 Image.fromarray(arr[..., 2]).save(os.path.join(dbg_root, f'{idx:04d}_reliability.png'))
-                center = arr[..., 0].astype(np.float32) / 255.0
-                soft = arr[..., 1].astype(np.float32) / 255.0
-                rel = arr[..., 2].astype(np.float32) / 255.0
-                final = np.clip(center + float(args.line_soft_weight) * soft * rel, 0, 1)
-                Image.fromarray((final * 255.0 + 0.5).astype(np.uint8)).save(os.path.join(dbg_root, f'{idx:04d}_final_line.png'))
 
     line_tensors = to_tensors()(line_imgs).unsqueeze(0) if line_imgs is not None else None
     frames, flow_masks, masks_dilated = frames.to(device), flow_masks.to(device), masks_dilated.to(device)
@@ -719,7 +715,7 @@ if __name__ == '__main__':
             l_t = len(neighbor_ids)
             
             # pred_img = selected_imgs # results of image propagation
-            pred_img = model(selected_imgs, selected_pred_flows_bi, selected_masks, selected_update_masks, l_t, line_guidance=selected_lines)
+            pred_img = model(selected_imgs, selected_pred_flows_bi, selected_masks, selected_update_masks, l_t, line_guidance=selected_lines, line_guidance_weight=args.line_guidance_weight)
             
             pred_img = pred_img.view(-1, 3, h, w)
 

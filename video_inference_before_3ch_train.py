@@ -1,0 +1,765 @@
+# -*- coding: utf-8 -*-
+import os
+import cv2
+import argparse
+import imageio
+import numpy as np
+import scipy.ndimage
+from PIL import Image
+from tqdm import tqdm
+
+import torch
+import torchvision
+
+from src.models.modules.flow_comp_raft import RAFT_bi
+from src.models.recurrent_flow_completion import RecurrentFlowCompleteNet
+from src.models.propainter import InpaintGenerator
+from utils.download_util import load_file_from_url
+from core.utils import to_tensors
+from core.dataset import load_lines_from_pkl, render_lines_to_pil
+from src.models.misc import get_device
+
+import warnings
+warnings.filterwarnings("ignore")
+
+pretrain_model_url = 'https://github.com/sczhou/ProPainter/releases/download/v0.1.0/'
+
+def imwrite(img, file_path, params=None, auto_mkdir=True):
+    if auto_mkdir:
+        dir_name = os.path.abspath(os.path.dirname(file_path))
+        os.makedirs(dir_name, exist_ok=True)
+    return cv2.imwrite(file_path, img, params)
+
+
+# resize frames
+def resize_frames(frames, size=None):    
+    if size is not None:
+        out_size = size
+        process_size = (out_size[0]-out_size[0]%8, out_size[1]-out_size[1]%8)
+        frames = [f.resize(process_size) for f in frames]
+    else:
+        out_size = frames[0].size
+        process_size = (out_size[0]-out_size[0]%8, out_size[1]-out_size[1]%8)
+        if not out_size == process_size:
+            frames = [f.resize(process_size) for f in frames]
+        
+    return frames, process_size, out_size
+
+
+#  read frames from video
+def read_frame_from_videos(frame_root):
+    if frame_root.endswith(('mp4', 'mov', 'avi', 'MP4', 'MOV', 'AVI')): # input video path
+        video_name = os.path.basename(frame_root)[:-4]
+        vframes, aframes, info = torchvision.io.read_video(filename=frame_root, pts_unit='sec') # RGB
+        frames = list(vframes.numpy())
+        frames = [Image.fromarray(f) for f in frames]
+        fps = info['video_fps']
+    else:
+        video_name = os.path.basename(frame_root)
+        frames = []
+        fr_lst = sorted(os.listdir(frame_root))
+        for fr in fr_lst:
+            frame = cv2.imread(os.path.join(frame_root, fr))
+            frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            frames.append(frame)
+        fps = None
+    size = frames[0].size
+
+    return frames, fps, size, video_name
+
+
+def binary_mask(mask, th=0.1):
+    mask[mask>th] = 1
+    mask[mask<=th] = 0
+    return mask
+  
+  
+def _percentile_normalize_line(line_gray, p_low=1.0, p_high=99.5, blur_ksize=0):
+    """Normalize a raw grayscale line map into a soft confidence map [0, 1]."""
+    line = line_gray.astype(np.float32)
+    if line.max() > 1.5:
+        line = line / 255.0
+    if blur_ksize and blur_ksize > 1:
+        k = int(blur_ksize)
+        if k % 2 == 0:
+            k += 1
+        line = cv2.GaussianBlur(line, (k, k), 0)
+    hi = np.percentile(line, p_high)
+    lo = np.percentile(line, p_low)
+    if hi <= lo + 1e-6:
+        return np.clip(line, 0, 1)
+    line = (line - lo) / (hi - lo + 1e-6)
+    return np.clip(line, 0, 1)
+
+
+def _hysteresis_keep_connected(soft, strong_thr=0.45, weak_thr=0.15):
+    """Keep weak line responses only if connected to strong responses."""
+    strong = soft >= float(strong_thr)
+    weak = soft >= float(weak_thr)
+    if weak.sum() == 0:
+        return weak, strong
+    if strong.sum() == 0:
+        # Fallback for globally faint line maps: keep weak responses.
+        return weak, weak
+    labels, num = scipy.ndimage.label(weak)
+    if num == 0:
+        return weak, strong
+    keep_ids = np.unique(labels[strong])
+    keep_ids = keep_ids[keep_ids > 0]
+    connected = np.isin(labels, keep_ids)
+    return connected, strong
+
+
+def _make_reliability_aware_line_field(
+        line_img,
+        mask_img=None,
+        strong_thr=0.45,
+        weak_thr=0.15,
+        soft_weight=0.35,
+        reliability_sigma=3.0,
+        boundary_width=5,
+        boundary_decay=0.20,
+        p_low=1.0,
+        p_high=99.5,
+        blur_ksize=0):
+    """Return a single-channel reliability-aware final line map.
+
+    This matches the single-channel fine-tuning setup. It computes
+    center/soft/reliability internally, then collapses them as:
+        final = center + soft_weight * soft * reliability
+    The returned PIL image is mode 'L', so to_tensors() gives [1,H,W].
+    """
+    gray = np.array(line_img.convert('L'))
+    soft = _percentile_normalize_line(gray, p_low=p_low, p_high=p_high, blur_ksize=blur_ksize)
+    connected, strong = _hysteresis_keep_connected(soft, strong_thr=strong_thr, weak_thr=weak_thr)
+
+    # Center/strong channel. Use connected strong-ish regions rather than a
+    # fragile one-pixel skeleton; the soft/reliability channels retain uncertainty.
+    center = strong.astype(np.float32)
+    if center.sum() == 0:
+        center = connected.astype(np.float32)
+
+    # Reliability: shallow lines close to a strong response are trusted, isolated
+    # shallow lines are suppressed.
+    if strong.sum() > 0:
+        dist = scipy.ndimage.distance_transform_edt(~strong)
+    else:
+        dist = scipy.ndimage.distance_transform_edt(~connected)
+    rel = soft * np.exp(-dist / max(float(reliability_sigma), 1e-6))
+    rel = np.clip(rel, 0, 1)
+
+    # Suppress false contours on mask boundaries.
+    if mask_img is not None and boundary_width > 0:
+        m = np.array(mask_img.convert('L')) > 127
+        dil = scipy.ndimage.binary_dilation(m, iterations=int(boundary_width))
+        ero = scipy.ndimage.binary_erosion(m, iterations=int(boundary_width))
+        boundary = (dil.astype(np.uint8) - ero.astype(np.uint8)).astype(bool)
+        decay = np.ones_like(soft, dtype=np.float32)
+        decay[boundary] = float(boundary_decay)
+        soft = soft * decay
+        rel = rel * decay
+        center = center * decay
+
+    final = center + float(soft_weight) * soft * rel
+    final = np.clip(final, 0, 1)
+    return Image.fromarray((final * 255.0 + 0.5).astype(np.uint8), mode='L')
+
+
+def build_reliability_line_fields(line_imgs, mask_imgs=None, temporal_alpha=0.15, **kwargs):
+    """Build single-channel reliability-aware final line maps for a video."""
+    if line_imgs is None:
+        return None
+    out = []
+    for i, line_img in enumerate(line_imgs):
+        mask_img = mask_imgs[i] if mask_imgs is not None and i < len(mask_imgs) else None
+        out.append(_make_reliability_aware_line_field(line_img, mask_img=mask_img, **kwargs))
+
+    # Lightweight temporal stabilization on the final single-channel line map.
+    if temporal_alpha and temporal_alpha > 0 and len(out) > 2:
+        arrs = [np.array(x.convert('L')).astype(np.float32) / 255.0 for x in out]
+        smoothed = []
+        for i, arr in enumerate(arrs):
+            prev_arr = arrs[max(0, i - 1)]
+            next_arr = arrs[min(len(arrs) - 1, i + 1)]
+            temporal = (prev_arr + arr + next_arr) / 3.0
+            arr2 = (1.0 - float(temporal_alpha)) * arr + float(temporal_alpha) * temporal
+            smoothed.append(Image.fromarray((np.clip(arr2, 0, 1) * 255.0 + 0.5).astype(np.uint8), mode='L'))
+        out = smoothed
+    return out
+
+
+# read frame-wise masks
+def read_mask(mpath, length, size, flow_mask_dilates=8, mask_dilates=5):
+    masks_img = []
+    masks_dilated = []
+    flow_masks = []
+
+    valid_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
+
+    if os.path.isfile(mpath):  # input single mask image path
+        if not mpath.lower().endswith(valid_exts):
+            raise ValueError(f'Unsupported mask file type: {mpath}')
+        mask_paths = [mpath]
+    else:
+        if not os.path.isdir(mpath):
+            raise FileNotFoundError(f'Mask path not found: {mpath}')
+        mnames = sorted([
+            n for n in os.listdir(mpath)
+            if os.path.splitext(n)[1].lower() in valid_exts
+        ])
+        if len(mnames) == 0:
+            raise FileNotFoundError(f'No mask image files found under: {mpath}')
+        if length is not None and len(mnames) > length:
+            print(f'[INFO] Number of masks ({len(mnames)}) is larger than number of frames ({length}). Truncating masks to {length}.')
+            mnames = mnames[:length]
+        mask_paths = [os.path.join(mpath, mp) for mp in mnames]
+
+    for mask_path in mask_paths:
+        mask_img = Image.open(mask_path)
+        if size is not None:
+            mask_img = mask_img.resize(size, Image.NEAREST)
+        mask_img = np.array(mask_img.convert('L'))
+
+        # Dilate 8 pixel so that all known pixel is trustworthy
+        if flow_mask_dilates > 0:
+            flow_mask_img = scipy.ndimage.binary_dilation(mask_img, iterations=flow_mask_dilates).astype(np.uint8)
+        else:
+            flow_mask_img = binary_mask(mask_img).astype(np.uint8)
+        # Close the small holes inside the foreground objects
+        # flow_mask_img = cv2.morphologyEx(flow_mask_img, cv2.MORPH_CLOSE, np.ones((21, 21),np.uint8)).astype(bool)
+        # flow_mask_img = scipy.ndimage.binary_fill_holes(flow_mask_img).astype(np.uint8)
+        flow_masks.append(Image.fromarray(flow_mask_img * 255))
+
+        if mask_dilates > 0:
+            mask_img = scipy.ndimage.binary_dilation(mask_img, iterations=mask_dilates).astype(np.uint8)
+        else:
+            mask_img = binary_mask(mask_img).astype(np.uint8)
+        masks_dilated.append(Image.fromarray(mask_img * 255))
+
+    # Make mask length exactly match frame length.
+    # If masks are fewer than frames, reuse them cyclically:
+    # image[mask_num] <-> mask[0], image[mask_num + 1] <-> mask[1], ...
+    if length is not None:
+        mask_num = len(masks_dilated)
+        if mask_num == 0:
+            raise RuntimeError(f'No valid masks loaded from: {mpath}')
+        if mask_num < length:
+            print(f'[WARN] Number of masks ({mask_num}) is smaller than number of frames ({length}). '
+                  f'Reusing masks cyclically by index modulo {mask_num}.')
+            flow_masks = [flow_masks[i % mask_num] for i in range(length)]
+            masks_dilated = [masks_dilated[i % mask_num] for i in range(length)]
+        elif mask_num > length:
+            flow_masks = flow_masks[:length]
+            masks_dilated = masks_dilated[:length]
+
+    return flow_masks, masks_dilated
+
+
+def _collect_framewise_files(path, exts, length):
+    """Collect sorted frame-wise files from a path.
+
+    If `path` is a file, repeat it for all frames. If it is a directory,
+    collect sorted files with allowed extensions.
+    """
+    if os.path.isfile(path):
+        return [path] * length
+
+    if not os.path.isdir(path):
+        raise FileNotFoundError(f'Line guidance path not found: {path}')
+
+    names = sorted([n for n in os.listdir(path) if os.path.splitext(n)[1].lower() in exts])
+    if len(names) > length:
+        names = names[:length]
+    return [os.path.join(path, n) for n in names]
+
+
+def read_line_guidance(line_path, length, size, line_width=1, line_swap_xy=True, line_invert_y=True):
+    """Read frame-wise line guidance maps.
+
+    Supports:
+    - pkl wireframes (*.pkl): rendered to line maps with swap/invert controls;
+    - image wireframes (*.png/*.jpg/*.jpeg): used directly (no coordinate transform).
+    Missing frames are padded with empty maps.
+    """
+    if line_path is None:
+        return None
+
+    line_imgs = []
+    path_ext = os.path.splitext(line_path)[1].lower()
+    if path_ext == '.pkl':
+        line_files = _collect_framewise_files(line_path, {'.pkl'}, length)
+        mode = 'pkl'
+    elif path_ext in {'.png', '.jpg', '.jpeg'}:
+        line_files = _collect_framewise_files(line_path, {'.png', '.jpg', '.jpeg'}, length)
+        mode = 'image'
+    else:
+        # directory: auto detect pkl/image format by contained files
+        if not os.path.isdir(line_path):
+            raise ValueError(f'Unsupported line guidance path: {line_path}')
+        pkl_files = _collect_framewise_files(line_path, {'.pkl'}, length)
+        img_files = _collect_framewise_files(line_path, {'.png', '.jpg', '.jpeg'}, length)
+        if len(pkl_files) > 0:
+            line_files, mode = pkl_files, 'pkl'
+        elif len(img_files) > 0:
+            line_files, mode = img_files, 'image'
+        else:
+            line_files, mode = [], 'image'
+
+    for i in range(length):
+        if i < len(line_files) and os.path.exists(line_files[i]):
+            if mode == 'pkl':
+                lines = load_lines_from_pkl(line_files[i])
+                line_img = render_lines_to_pil(lines, size, line_width=line_width,
+                                               swap_xy=line_swap_xy, invert_y=line_invert_y)
+            else:
+                line_img = Image.open(line_files[i]).convert('L')
+                if line_img.size != size:
+                    line_img = line_img.resize(size, Image.BILINEAR)
+        else:
+            line_img = Image.fromarray(np.zeros((size[1], size[0]), dtype=np.uint8), mode='L')
+        line_imgs.append(line_img)
+
+    if len(line_imgs) == 1:
+        line_imgs = line_imgs * length
+    if len(line_imgs) < length:
+        empty = Image.fromarray(np.zeros((size[1], size[0]), dtype=np.uint8), mode='L')
+        line_imgs.extend([empty] * (length - len(line_imgs)))
+    return line_imgs
+
+
+def extrapolation(video_ori, scale):
+    """Prepares the data for video outpainting.
+    """
+    nFrame = len(video_ori)
+    imgW, imgH = video_ori[0].size
+
+    # Defines new FOV.
+    imgH_extr = int(scale[0] * imgH)
+    imgW_extr = int(scale[1] * imgW)
+    imgH_extr = imgH_extr - imgH_extr % 8
+    imgW_extr = imgW_extr - imgW_extr % 8
+    H_start = int((imgH_extr - imgH) / 2)
+    W_start = int((imgW_extr - imgW) / 2)
+
+    # Extrapolates the FOV for video.
+    frames = []
+    for v in video_ori:
+        frame = np.zeros(((imgH_extr, imgW_extr, 3)), dtype=np.uint8)
+        frame[H_start: H_start + imgH, W_start: W_start + imgW, :] = v
+        frames.append(Image.fromarray(frame))
+
+    # Generates the mask for missing region.
+    masks_dilated = []
+    flow_masks = []
+    
+    dilate_h = 4 if H_start > 10 else 0
+    dilate_w = 4 if W_start > 10 else 0
+    mask = np.ones(((imgH_extr, imgW_extr)), dtype=np.uint8)
+    
+    mask[H_start+dilate_h: H_start+imgH-dilate_h, 
+         W_start+dilate_w: W_start+imgW-dilate_w] = 0
+    flow_masks.append(Image.fromarray(mask * 255))
+
+    mask[H_start: H_start+imgH, W_start: W_start+imgW] = 0
+    masks_dilated.append(Image.fromarray(mask * 255))
+  
+    flow_masks = flow_masks * nFrame
+    masks_dilated = masks_dilated * nFrame
+    
+    return frames, flow_masks, masks_dilated, (imgW_extr, imgH_extr)
+
+
+def get_ref_index(mid_neighbor_id, neighbor_ids, length, ref_stride=10, ref_num=-1):
+    ref_index = []
+    if ref_num == -1:
+        for i in range(0, length, ref_stride):
+            if i not in neighbor_ids:
+                ref_index.append(i)
+    else:
+        start_idx = max(0, mid_neighbor_id - ref_stride * (ref_num // 2))
+        end_idx = min(length, mid_neighbor_id + ref_stride * (ref_num // 2))
+        for i in range(start_idx, end_idx, ref_stride):
+            if i not in neighbor_ids:
+                if len(ref_index) > ref_num:
+                    break
+                ref_index.append(i)
+    return ref_index
+
+
+
+if __name__ == '__main__':
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '-i', '--video', type=str, default='inputs/object_removal/bmx-trees', help='Path of the input video or image folder.')
+    parser.add_argument(
+        '-m', '--mask', type=str, default='inputs/object_removal/bmx-trees_mask', help='Path of the mask(s) or mask folder.')
+    parser.add_argument(
+        '--line', type=str, default=None, help='Optional path of frame-wise line maps (*.pkl or *.png/*.jpg/*.jpeg).')
+    parser.add_argument(
+        '--line_width', type=int, default=1, help='Rendered pkl wireframe thickness in pixels. Ignored for image line maps. Default: 1')
+    parser.add_argument(
+        '--line_no_swap_xy', action='store_true', help='Disable x/y swap when rendering pkl lines. Ignored for image line maps.')
+    parser.add_argument(
+        '--line_no_invert_y', action='store_true', help='Disable image-coordinate y-axis convention when rendering pkl lines. Ignored for image line maps.')
+    parser.add_argument(
+        '--line_soft_guidance', action='store_true',
+        help='Use reliability-aware single-channel soft line map: center + soft_weight * soft * reliability.')
+    parser.add_argument('--line_strong_thr', type=float, default=0.45, help='Strong threshold for reliability-aware line processing.')
+    parser.add_argument('--line_weak_thr', type=float, default=0.15, help='Weak threshold for reliability-aware line processing.')
+    parser.add_argument('--line_soft_weight', type=float, default=0.35, help='Weight for final single-channel map: center + weight * soft * reliability. Default 0.35 matches fine-tuning preprocessing.')
+    parser.add_argument('--line_reliability_sigma', type=float, default=3.0, help='Distance decay sigma for reliability map.')
+    parser.add_argument('--line_boundary_width', type=int, default=5, help='Suppress line responses around mask boundary by this width.')
+    parser.add_argument('--line_boundary_decay', type=float, default=0.20, help='Multiplier for line responses on mask boundary.')
+    parser.add_argument('--line_norm_p_low', type=float, default=1.0, help='Low percentile for soft line normalization.')
+    parser.add_argument('--line_norm_p_high', type=float, default=99.5, help='High percentile for soft line normalization.')
+    parser.add_argument('--line_blur_ksize', type=int, default=0, help='Optional Gaussian blur kernel size before line normalization; 0 disables it.')
+    parser.add_argument('--line_temporal_alpha', type=float, default=0.15, help='Temporal smoothing strength for soft/reliability channels.')
+    parser.add_argument('--save_line_debug', action='store_true', help='Save processed center/soft/reliability line maps for debugging.')
+    parser.add_argument(
+        '-o', '--output', type=str, default='results', help='Output folder. Default: results')
+    parser.add_argument(
+        '--ckpt_path',
+        type=str,
+        default=None,
+        help='Path to ProPainter/InpaintGenerator checkpoint, e.g. experiments_model/.../gen_010000.pth. If None, use official ProPainter.pth.')
+    parser.add_argument(
+        "--resize_ratio", type=float, default=1.0, help='Resize scale for processing video.')
+    parser.add_argument(
+        '--height', type=int, default=-1, help='Height of the processing video.')
+    parser.add_argument(
+        '--width', type=int, default=-1, help='Width of the processing video.')
+    parser.add_argument(
+        '--mask_dilation', type=int, default=0, help='Mask dilation for video and flow masking.')
+    parser.add_argument(
+        "--ref_stride", type=int, default=10, help='Stride of global reference frames.')
+    parser.add_argument(
+        "--neighbor_length", type=int, default=10, help='Length of local neighboring frames.')
+    parser.add_argument(
+        "--subvideo_length", type=int, default=80, help='Length of sub-video for long video inference.')
+    parser.add_argument(
+        "--raft_iter", type=int, default=20, help='Iterations for RAFT inference.')
+    parser.add_argument(
+        '--mode', default='video_inpainting', choices=['video_inpainting', 'video_outpainting'], help="Modes: video_inpainting / video_outpainting")
+    parser.add_argument(
+        '--scale_h', type=float, default=1.0, help='Outpainting scale of height for video_outpainting mode.')
+    parser.add_argument(
+        '--scale_w', type=float, default=1.2, help='Outpainting scale of width for video_outpainting mode.')
+    parser.add_argument(
+        '--save_fps', type=int, default=24, help='Frame per second. Default: 24')
+    parser.add_argument(
+        '--save_frames', action='store_true', help='Save output frames. Default: False')
+    parser.add_argument(
+        '--fp16', action='store_true', help='Use fp16 (half precision) during inference. Default: fp32 (single precision).')
+
+    args = parser.parse_args()
+
+    # Use fp16 precision during inference to reduce running memory cost
+    use_half = True if args.fp16 else False 
+    if device == torch.device('cpu'):
+        use_half = False
+
+    frames, fps, size, video_name = read_frame_from_videos(args.video)
+    if not args.width == -1 and not args.height == -1:
+        size = (args.width, args.height)
+    if not args.resize_ratio == 1.0:
+        size = (int(args.resize_ratio * size[0]), int(args.resize_ratio * size[1]))
+
+    frames, size, out_size = resize_frames(frames, size)
+    
+    fps = args.save_fps if fps is None else fps
+    save_root = os.path.join(args.output, video_name)
+    if not os.path.exists(save_root):
+        os.makedirs(save_root, exist_ok=True)
+
+    if args.mode == 'video_inpainting':
+        frames_len = len(frames)
+        flow_masks, masks_dilated = read_mask(args.mask, frames_len, size, 
+                                              flow_mask_dilates=args.mask_dilation,
+                                              mask_dilates=args.mask_dilation)
+        line_imgs = read_line_guidance(args.line, frames_len, size,
+                                  line_width=args.line_width,
+                                  line_swap_xy=not args.line_no_swap_xy,
+                                  line_invert_y=not args.line_no_invert_y)
+        if args.line_soft_guidance and line_imgs is not None:
+            line_imgs = build_reliability_line_fields(
+                line_imgs, mask_imgs=masks_dilated,
+                strong_thr=args.line_strong_thr,
+                weak_thr=args.line_weak_thr,
+                soft_weight=args.line_soft_weight,
+                reliability_sigma=args.line_reliability_sigma,
+                boundary_width=args.line_boundary_width,
+                boundary_decay=args.line_boundary_decay,
+                p_low=args.line_norm_p_low,
+                p_high=args.line_norm_p_high,
+                blur_ksize=args.line_blur_ksize,
+                temporal_alpha=args.line_temporal_alpha)
+        w, h = size
+    elif args.mode == 'video_outpainting':
+        assert args.scale_h is not None and args.scale_w is not None, 'Please provide a outpainting scale (s_h, s_w).'
+        frames, flow_masks, masks_dilated, size = extrapolation(frames, (args.scale_h, args.scale_w))
+        line_imgs = None
+        w, h = size
+    else:
+        raise NotImplementedError
+    
+    # for saving the masked frames or video
+    masked_frame_for_save = []
+    for i in range(len(frames)):
+        mask_ = np.expand_dims(np.array(masks_dilated[i]),2).repeat(3, axis=2)/255.
+        img = np.array(frames[i])
+        green = np.zeros([h, w, 3]) 
+        green[:,:,1] = 255
+        alpha = 0.6
+        # alpha = 1.0
+        fuse_img = (1-alpha)*img + alpha*green
+        fuse_img = mask_ * fuse_img + (1-mask_)*img
+        masked_frame_for_save.append(fuse_img.astype(np.uint8))
+
+    frames_inp = [np.array(f).astype(np.uint8) for f in frames]
+    frames = to_tensors()(frames).unsqueeze(0) * 2 - 1    
+    flow_masks = to_tensors()(flow_masks).unsqueeze(0)
+    masks_dilated = to_tensors()(masks_dilated).unsqueeze(0)
+    if args.save_line_debug and line_imgs is not None:
+        dbg_root = os.path.join(save_root, 'line_debug')
+        os.makedirs(dbg_root, exist_ok=True)
+        for idx, li in enumerate(line_imgs):
+            arr = np.array(li)
+            if arr.ndim == 2:
+                Image.fromarray(arr).save(os.path.join(dbg_root, f'{idx:04d}_final_line.png'))
+            else:
+                # Backward compatibility only; the single-channel path should not enter here.
+                Image.fromarray(arr[..., 0]).save(os.path.join(dbg_root, f'{idx:04d}_center.png'))
+                Image.fromarray(arr[..., 1]).save(os.path.join(dbg_root, f'{idx:04d}_soft.png'))
+                Image.fromarray(arr[..., 2]).save(os.path.join(dbg_root, f'{idx:04d}_reliability.png'))
+                center = arr[..., 0].astype(np.float32) / 255.0
+                soft = arr[..., 1].astype(np.float32) / 255.0
+                rel = arr[..., 2].astype(np.float32) / 255.0
+                final = np.clip(center + float(args.line_soft_weight) * soft * rel, 0, 1)
+                Image.fromarray((final * 255.0 + 0.5).astype(np.uint8)).save(os.path.join(dbg_root, f'{idx:04d}_final_line.png'))
+
+    line_tensors = to_tensors()(line_imgs).unsqueeze(0) if line_imgs is not None else None
+    frames, flow_masks, masks_dilated = frames.to(device), flow_masks.to(device), masks_dilated.to(device)
+    if line_tensors is not None:
+        line_tensors = line_tensors.to(device)
+
+    
+    ##############################################
+    # set up RAFT and flow competition model
+    ##############################################
+    ckpt_path = load_file_from_url(url=os.path.join(pretrain_model_url, 'raft-things.pth'), 
+                                    model_dir='weights', progress=True, file_name=None)
+    fix_raft = RAFT_bi(ckpt_path, device)
+    
+    ckpt_path = load_file_from_url(url=os.path.join(pretrain_model_url, 'recurrent_flow_completion.pth'), 
+                                    model_dir='weights', progress=True, file_name=None)
+    fix_flow_complete = RecurrentFlowCompleteNet(ckpt_path)
+    for p in fix_flow_complete.parameters():
+        p.requires_grad = False
+    fix_flow_complete.to(device)
+    fix_flow_complete.eval()
+
+
+    ##############################################
+    # set up ProPainter model
+    ##############################################
+    if args.ckpt_path is None:
+        ckpt_path = load_file_from_url(url=os.path.join(pretrain_model_url, 'ProPainter.pth'), 
+                                        model_dir='weights', progress=True, file_name=None)
+    else:
+        ckpt_path = args.ckpt_path
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f'Checkpoint not found: {ckpt_path}')
+
+    print(f"[INFO] Loading inpainting checkpoint: {ckpt_path}")
+    model = InpaintGenerator(model_path=ckpt_path).to(device)
+    model.eval()
+
+    
+    ##############################################
+    # ProPainter inference
+    ##############################################
+    video_length = frames.size(1)
+    print(f'\nProcessing: {video_name} [{video_length} frames]...')
+    with torch.no_grad():
+        # ---- compute flow ----
+        if frames.size(-1) <= 640: 
+            short_clip_len = 12
+        elif frames.size(-1) <= 720: 
+            short_clip_len = 8
+        elif frames.size(-1) <= 1280:
+            short_clip_len = 4
+        else:
+            short_clip_len = 2
+        
+        # use fp32 for RAFT
+        if frames.size(1) > short_clip_len:
+            gt_flows_f_list, gt_flows_b_list = [], []
+            for f in range(0, video_length, short_clip_len):
+                end_f = min(video_length, f + short_clip_len)
+                if f == 0:
+                    flows_f, flows_b = fix_raft(frames[:,f:end_f], iters=args.raft_iter)
+                else:
+                    flows_f, flows_b = fix_raft(frames[:,f-1:end_f], iters=args.raft_iter)
+                
+                gt_flows_f_list.append(flows_f)
+                gt_flows_b_list.append(flows_b)
+                torch.cuda.empty_cache()
+                
+            gt_flows_f = torch.cat(gt_flows_f_list, dim=1)
+            gt_flows_b = torch.cat(gt_flows_b_list, dim=1)
+            gt_flows_bi = (gt_flows_f, gt_flows_b)
+        else:
+            gt_flows_bi = fix_raft(frames, iters=args.raft_iter)
+            torch.cuda.empty_cache()
+
+
+        if use_half:
+            frames, flow_masks, masks_dilated = frames.half(), flow_masks.half(), masks_dilated.half()
+            if line_tensors is not None:
+                line_tensors = line_tensors.half()
+            gt_flows_bi = (gt_flows_bi[0].half(), gt_flows_bi[1].half())
+            fix_flow_complete = fix_flow_complete.half()
+            model = model.half()
+
+        
+        # ---- complete flow ----
+        flow_length = gt_flows_bi[0].size(1)
+        if flow_length > args.subvideo_length:
+            pred_flows_f, pred_flows_b = [], []
+            pad_len = 5
+            for f in range(0, flow_length, args.subvideo_length):
+                s_f = max(0, f - pad_len)
+                e_f = min(flow_length, f + args.subvideo_length + pad_len)
+                pad_len_s = max(0, f) - s_f
+                pad_len_e = e_f - min(flow_length, f + args.subvideo_length)
+                pred_flows_bi_sub, _ = fix_flow_complete.forward_bidirect_flow(
+                    (gt_flows_bi[0][:, s_f:e_f], gt_flows_bi[1][:, s_f:e_f]), 
+                    flow_masks[:, s_f:e_f+1])
+                pred_flows_bi_sub = fix_flow_complete.combine_flow(
+                    (gt_flows_bi[0][:, s_f:e_f], gt_flows_bi[1][:, s_f:e_f]), 
+                    pred_flows_bi_sub, 
+                    flow_masks[:, s_f:e_f+1])
+
+                pred_flows_f.append(pred_flows_bi_sub[0][:, pad_len_s:e_f-s_f-pad_len_e])
+                pred_flows_b.append(pred_flows_bi_sub[1][:, pad_len_s:e_f-s_f-pad_len_e])
+                torch.cuda.empty_cache()
+                
+            pred_flows_f = torch.cat(pred_flows_f, dim=1)
+            pred_flows_b = torch.cat(pred_flows_b, dim=1)
+            pred_flows_bi = (pred_flows_f, pred_flows_b)
+        else:
+            pred_flows_bi, _ = fix_flow_complete.forward_bidirect_flow(gt_flows_bi, flow_masks)
+            pred_flows_bi = fix_flow_complete.combine_flow(gt_flows_bi, pred_flows_bi, flow_masks)
+            torch.cuda.empty_cache()
+            
+
+        # ---- image propagation ----
+        masked_frames = frames * (1 - masks_dilated)
+        subvideo_length_img_prop = min(100, args.subvideo_length) # ensure a minimum of 100 frames for image propagation
+        if video_length > subvideo_length_img_prop:
+            updated_frames, updated_masks = [], []
+            pad_len = 10
+            for f in range(0, video_length, subvideo_length_img_prop):
+                s_f = max(0, f - pad_len)
+                e_f = min(video_length, f + subvideo_length_img_prop + pad_len)
+                pad_len_s = max(0, f) - s_f
+                pad_len_e = e_f - min(video_length, f + subvideo_length_img_prop)
+
+                b, t, _, _, _ = masks_dilated[:, s_f:e_f].size()
+                pred_flows_bi_sub = (pred_flows_bi[0][:, s_f:e_f-1], pred_flows_bi[1][:, s_f:e_f-1])
+                prop_imgs_sub, updated_local_masks_sub = model.img_propagation(masked_frames[:, s_f:e_f], 
+                                                                       pred_flows_bi_sub, 
+                                                                       masks_dilated[:, s_f:e_f], 
+                                                                       'nearest')
+                updated_frames_sub = frames[:, s_f:e_f] * (1 - masks_dilated[:, s_f:e_f]) + \
+                                    prop_imgs_sub.view(b, t, 3, h, w) * masks_dilated[:, s_f:e_f]
+                updated_masks_sub = updated_local_masks_sub.view(b, t, 1, h, w)
+                
+                updated_frames.append(updated_frames_sub[:, pad_len_s:e_f-s_f-pad_len_e])
+                updated_masks.append(updated_masks_sub[:, pad_len_s:e_f-s_f-pad_len_e])
+                torch.cuda.empty_cache()
+                
+            updated_frames = torch.cat(updated_frames, dim=1)
+            updated_masks = torch.cat(updated_masks, dim=1)
+        else:
+            b, t, _, _, _ = masks_dilated.size()
+            prop_imgs, updated_local_masks = model.img_propagation(masked_frames, pred_flows_bi, masks_dilated, 'nearest')
+            updated_frames = frames * (1 - masks_dilated) + prop_imgs.view(b, t, 3, h, w) * masks_dilated
+            updated_masks = updated_local_masks.view(b, t, 1, h, w)
+            torch.cuda.empty_cache()
+            
+    
+    ori_frames = frames_inp
+    comp_frames = [None] * video_length
+
+    neighbor_stride = args.neighbor_length // 2
+    if video_length > args.subvideo_length:
+        ref_num = args.subvideo_length // args.ref_stride
+    else:
+        ref_num = -1
+    
+    # ---- feature propagation + transformer ----
+    for f in tqdm(range(0, video_length, neighbor_stride)):
+        neighbor_ids = [
+            i for i in range(max(0, f - neighbor_stride),
+                                min(video_length, f + neighbor_stride + 1))
+        ]
+        ref_ids = get_ref_index(f, neighbor_ids, video_length, args.ref_stride, ref_num)
+        selected_imgs = updated_frames[:, neighbor_ids + ref_ids, :, :, :]
+        selected_masks = masks_dilated[:, neighbor_ids + ref_ids, :, :, :]
+        selected_update_masks = updated_masks[:, neighbor_ids + ref_ids, :, :, :]
+        selected_lines = line_tensors[:, neighbor_ids + ref_ids, :, :, :] if line_tensors is not None else None
+        selected_pred_flows_bi = (pred_flows_bi[0][:, neighbor_ids[:-1], :, :, :], pred_flows_bi[1][:, neighbor_ids[:-1], :, :, :])
+        
+        with torch.no_grad():
+            # 1.0 indicates mask
+            l_t = len(neighbor_ids)
+            
+            # pred_img = selected_imgs # results of image propagation
+            pred_img = model(selected_imgs, selected_pred_flows_bi, selected_masks, selected_update_masks, l_t, line_guidance=selected_lines)
+            
+            pred_img = pred_img.view(-1, 3, h, w)
+
+            pred_img = (pred_img + 1) / 2
+            pred_img = pred_img.cpu().permute(0, 2, 3, 1).numpy() * 255
+            binary_masks = masks_dilated[0, neighbor_ids, :, :, :].cpu().permute(
+                0, 2, 3, 1).numpy().astype(np.uint8)
+            for i in range(len(neighbor_ids)):
+                idx = neighbor_ids[i]
+                img = np.array(pred_img[i]).astype(np.uint8) * binary_masks[i] \
+                    + ori_frames[idx] * (1 - binary_masks[i])
+                if comp_frames[idx] is None:
+                    comp_frames[idx] = img
+                else: 
+                    comp_frames[idx] = comp_frames[idx].astype(np.float32) * 0.5 + img.astype(np.float32) * 0.5
+                    
+                comp_frames[idx] = comp_frames[idx].astype(np.uint8)
+        
+        torch.cuda.empty_cache()
+                
+    # save each frame
+    if args.save_frames:
+        for idx in range(video_length):
+            f = comp_frames[idx]
+            f = cv2.resize(f, out_size, interpolation = cv2.INTER_CUBIC)
+            f = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+            img_save_root = os.path.join(save_root, 'frames', str(idx).zfill(4)+'.png')
+            imwrite(f, img_save_root)
+                    
+
+    # if args.mode == 'video_outpainting':
+    #     comp_frames = [i[10:-10,10:-10] for i in comp_frames]
+    #     masked_frame_for_save = [i[10:-10,10:-10] for i in masked_frame_for_save]
+    
+    # save videos frame
+    masked_frame_for_save = [cv2.resize(f, out_size) for f in masked_frame_for_save]
+    comp_frames = [cv2.resize(f, out_size) for f in comp_frames]
+    imageio.mimwrite(os.path.join(save_root, 'masked_in.mp4'), masked_frame_for_save, fps=fps, quality=7)
+    imageio.mimwrite(os.path.join(save_root, 'inpaint_out.mp4'), comp_frames, fps=fps, quality=7)
+    
+    print(f'\nAll results are saved in {save_root}')
+    
+    torch.cuda.empty_cache()

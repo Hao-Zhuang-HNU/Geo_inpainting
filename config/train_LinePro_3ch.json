@@ -1,0 +1,75 @@
+{
+    "seed": 2026,
+    "save_dir": "./experiments_model/",
+    "train_data_loader": {
+        "name": "custom_list",
+        "use_list": true,
+        "video_list": "./data_list/mixed_imgs_train_filter40.txt",
+        "mask_list": "./data_list/irregular_mask_20_30.txt",
+        "line_list": "./data_list/mixed_softline_mask_20_30.txt",
+        "flow_list": "",
+        "w": 256,
+        "h": 256,
+        "num_local_frames": 5,
+        "num_ref_frames": 2,
+        "load_flow": 0,
+        "line_width": 1,
+        "line_force_rgb": true,
+        "line_swap_xy": true,
+        "line_invert_y": true,
+        "mask_match_mode": "frame_index",
+        "flow_root": "unused_when_load_flow_is_0",
+        "line_train_aug": false,
+        "return_clean_line_for_loss": true,
+        "line_dropout_prob": 0.0,
+        "line_hole_empty_prob": 0.0,
+        "line_hole_dropout_prob": 0.0,
+        "line_shift_prob": 0.0,
+        "line_dilate_prob": 0.0,
+        "line_erode_prob": 0.0,
+        "line_noise_prob": 0.0
+    },
+    "model": {
+        "net": "propainter",
+        "no_dis": 1,
+        "load_d": 0,
+        "interp_mode": "nearest",
+        "reliability_line_weight": 0.35
+    },
+    "line_guidance_weight": 1.0,
+    "losses": {
+        "hole_weight": 5.0,
+        "valid_weight": 1.0,
+        "flow_weight": 0.0,
+        "adversarial_weight": 0.0,
+        "GAN_LOSS": "hinge",
+        "perceptual_weight": 0.05,
+        "line_weighted_weight": 0.0,
+        "line_loss_alpha": 3.0,
+        "sobel_weight": 0.0,
+        "sobel_line_alpha": 2.0,
+        "laplacian_weight": 0.02
+    },
+    "trainer": {
+        "version": "trainer",
+        "type": "Adam",
+        "beta1": 0,
+        "beta2": 0.99,
+        "lr": 0.0001,
+        "batch_size": 1,
+        "num_workers": 8,
+        "num_prefetch_queue": 4,
+        "log_freq": 100,
+        "save_freq": 5000,
+        "iterations": 100000,
+        "freeze_mode": "reliability_only",
+        "scheduler": {
+            "type": "MultiStepLR",
+            "milestones": [
+                7000
+            ],
+            "gamma": 0.5
+        },
+        "gen_path": "./experiments_model/propainter_train_LinePro_laplacianloss/gen_040000.pth"
+    }
+}
